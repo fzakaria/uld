@@ -1,0 +1,7 @@
+[toolchain]
+channel = "nightly"
+profile = "default"
+components = [
+  # For rust-analyzer
+  "rust-src",
+]
