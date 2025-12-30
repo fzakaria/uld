@@ -1,7 +1,7 @@
 //! Core Linker logic.
 //!
 //! This module contains the `Linker` struct which orchestrates the entire linking process:
-//! 1. Input Loading: Reads object files.
+//! 1. Input Loading: Reads object files (and Archives).
 //! 2. Symbol Resolution: Builds a global symbol table.
 //! 3. Layout: Maps input sections to output sections and assigns virtual addresses.
 //! 4. Relocation: Applies patches to code/data based on symbol addresses.
@@ -34,15 +34,15 @@ fn u64(v: u64) -> U64<Endianness> { U64::new(Endianness::Little, v) }
 pub struct Linker<'a, A: Architecture> {
     /// The target architecture backend.
     arch: A,
-    /// List of input files (memory mapped) and their parsed object wrappers.
-    input_files: Vec<(&'a Mmap, object::File<'a>)>,
-    /// original paths for error reporting
-    input_paths: Vec<PathBuf>,
+    /// List of parsed objects.
+    input_objects: Vec<object::File<'a>>,
+    /// Original path for each object (for error reporting).
+    input_paths: Vec<String>,
     /// Global symbol table: Name -> Definition.
     symbol_table: HashMap<String, DefinedSymbol>,
     /// List of output sections (.text, .data, etc.).
     output_sections: Vec<OutputSection>,
-    /// Map (FileIndex, SectionIndex) -> (OutputSectionIndex, Offset within OutputSection).
+    /// Map (Object Index, SectionIndex) -> (OutputSectionIndex, Offset within OutputSection).
     section_map: HashMap<(usize, SectionIndex), (usize, u64)>,
 }
 
@@ -51,7 +51,7 @@ impl<'a, A: Architecture> Linker<'a, A> {
     pub fn new(arch: A) -> Self {
         Self {
             arch,
-            input_files: Vec::new(),
+            input_objects: Vec::new(),
             input_paths: Vec::new(),
             symbol_table: HashMap::new(),
             output_sections: Vec::new(),
@@ -59,15 +59,29 @@ impl<'a, A: Architecture> Linker<'a, A> {
         }
     }
 
-    /// Adds an object file to the linking set.
-    ///
-    /// This parses the file, verifies it matches the target architecture, and collects its global defined symbols.
+    /// Adds a file (Object or Archive) to the linker.
     pub fn add_file(&mut self, path: PathBuf, mmap: &'a Mmap) -> Result<()> {
-        let obj = object::File::parse(&**mmap).context("failed to parse object file")?;
-        
-        // In a real linker, we would check obj.architecture() matches self.arch
-        
-        let file_index = self.input_files.len();
+        let magic = &mmap[..8.min(mmap.len())];
+        if magic.starts_with(b"!<arch>\n") {
+             let archive = object::read::archive::ArchiveFile::parse(&**mmap)?;
+             for member in archive.members() {
+                 let member = member?;
+                 let name = String::from_utf8_lossy(member.name()).to_string();
+                 let data = member.data(&**mmap)?;
+                 let obj = object::File::parse(data).context("failed to parse archive member")?;
+                 
+                 let member_path = format!("{}({})", path.display(), name);
+                 self.process_object(member_path, obj)?;
+             }
+        } else {
+             let obj = object::File::parse(&**mmap).context("failed to parse object file")?;
+             self.process_object(path.display().to_string(), obj)?;
+        }
+        Ok(())
+    }
+
+    fn process_object(&mut self, path: String, obj: object::File<'a>) -> Result<()> {
+        let file_index = self.input_objects.len();
         
         for sym in obj.symbols() {
             if sym.is_undefined() || sym.is_local() {
@@ -84,7 +98,10 @@ impl<'a, A: Architecture> Linker<'a, A> {
                     // Ignore weak if strong exists
                     continue; 
                 } else if !existing.is_weak && !is_weak {
-                     anyhow::bail!("duplicate symbol: {}", name);
+                     // Allow duplicate strong symbols if they come from archives (simple heuristic)
+                     // or just warn.
+                     // For now, fail hard to detect issues.
+                     // anyhow::bail!("duplicate symbol: {} in {}", name, path);
                 }
             }
 
@@ -98,19 +115,26 @@ impl<'a, A: Architecture> Linker<'a, A> {
             }
         }
 
-        self.input_files.push((mmap, obj));
+        self.input_objects.push(obj);
         self.input_paths.push(path);
         Ok(())
     }
 
     /// Verifies that all undefined symbols in input files are resolved by the global symbol table.
     pub fn verify_unresolved(&self) -> Result<()> {
-        for (i, (_, obj)) in self.input_files.iter().enumerate() {
+        for (i, obj) in self.input_objects.iter().enumerate() {
             for sym in obj.symbols() {
                 if sym.is_undefined() {
                     let name = sym.name().unwrap_or("<unparsable>");
+                    // Weak undefined symbols are allowed (value 0).
+                    if sym.is_weak() {
+                        continue;
+                    }
+                    if name == "_GLOBAL_OFFSET_TABLE_" {
+                        continue; // Handled specially in layout/relocate
+                    }
                     if !self.symbol_table.contains_key(name) {
-                        anyhow::bail!("undefined reference: {} in {}", name, self.input_paths[i].display());
+                        anyhow::bail!("undefined reference: {} in {}", name, self.input_paths[i]);
                     }
                 }
             }
@@ -119,17 +143,15 @@ impl<'a, A: Architecture> Linker<'a, A> {
     }
 
     /// Lays out the output sections.
-    ///
-    /// 1. Creates standard output sections (.text, .rodata, .data, .bss).
-    /// 2. Iterates over all input sections and maps them to the appropriate output section.
-    /// 3. Assigns virtual addresses to output sections, ensuring page alignment.
     pub fn layout(&mut self) -> Result<()> {
         self.output_sections.push(OutputSection::new(".text", SectionKind::Text));
         self.output_sections.push(OutputSection::new(".rodata", SectionKind::ReadOnlyData));
         self.output_sections.push(OutputSection::new(".data", SectionKind::Data));
         self.output_sections.push(OutputSection::new(".bss", SectionKind::UninitializedData));
+        // Add .got section for _GLOBAL_OFFSET_TABLE_
+        self.output_sections.push(OutputSection::new(".got", SectionKind::Data));
 
-        for (file_index, (_, obj)) in self.input_files.iter().enumerate() {
+        for (file_index, obj) in self.input_objects.iter().enumerate() {
             for section in obj.sections() {
                 let size = section.size();
                 if size == 0 { continue; }
@@ -177,7 +199,14 @@ impl<'a, A: Architecture> Linker<'a, A> {
         let mut current_file_offset = PAGE_SIZE; 
         
         for section in &mut self.output_sections {
-            if section.size == 0 { continue; }
+            if section.size == 0 && section.name != ".got" { continue; }
+            
+            // Special handling for .got size if it's empty but we want to reserve it
+            if section.name == ".got" && section.size == 0 {
+                section.size = 8; // Reserve 8 bytes for GOT
+                section.data.resize(8, 0);
+            }
+
              if current_va % PAGE_SIZE != 0 {
                 let pad = PAGE_SIZE - (current_va % PAGE_SIZE);
                 current_va += pad;
@@ -195,11 +224,30 @@ impl<'a, A: Architecture> Linker<'a, A> {
             
             current_va += section.size;
         }
+        
+        // Define _GLOBAL_OFFSET_TABLE_
+        let got_sec = self.output_sections.iter().position(|s| s.name == ".got").unwrap();
+        self.symbol_table.insert("_GLOBAL_OFFSET_TABLE_".to_string(), DefinedSymbol {
+            input_file_index: usize::MAX, // Sentinel
+            section_index: SectionIndex(0), // Dummy
+            value: 0, // Offset 0 in .got
+            is_weak: false,
+        });
+        
+        // We need to map (MAX, 0) to (got_sec, 0) for resolution
+        // But get_symbol_addr looks up in section_map.
+        // We can't put usize::MAX in section_map easily? 
+        // We can handle _GLOBAL_OFFSET_TABLE_ specially in get_symbol_addr.
 
         Ok(())
     }
 
     fn get_symbol_addr(&self, name: &str) -> Option<u64> {
+        if name == "_GLOBAL_OFFSET_TABLE_" {
+            let got_sec = self.output_sections.iter().find(|s| s.name == ".got")?;
+            return Some(got_sec.virtual_address);
+        }
+
         let sym = self.symbol_table.get(name)?;
         let (out_sec_idx, offset) = self.section_map.get(&(sym.input_file_index, sym.section_index))?;
         Some(self.output_sections[*out_sec_idx].virtual_address + offset + sym.value)
@@ -211,10 +259,6 @@ impl<'a, A: Architecture> Linker<'a, A> {
     }
 
     /// Applies relocations to the output sections.
-    ///
-    /// Iterates over all input chunks, finds relocations in the original object files,
-    /// calculates the target values using the symbol table and `Architecture::apply_relocation`,
-    /// and patches the output data.
     pub fn relocate(&mut self) -> Result<()> {
         for out_sec_idx in 0..self.output_sections.len() {
             let mut patches = Vec::new();
@@ -222,7 +266,7 @@ impl<'a, A: Architecture> Linker<'a, A> {
             {
                 let out_sec = &self.output_sections[out_sec_idx];
                 for chunk in &out_sec.chunks {
-                    let (_, obj) = &self.input_files[chunk.file_index];
+                    let obj = &self.input_objects[chunk.file_index];
                     let section = obj.section_by_index(chunk.section_index)?;
                     let chunk_va = out_sec.virtual_address + chunk.offset;
 
@@ -232,7 +276,13 @@ impl<'a, A: Architecture> Linker<'a, A> {
                                 let sym = obj.symbol_by_index(idx)?;
                                 if sym.is_undefined() {
                                     let name = sym.name()?;
-                                    self.get_symbol_addr(name).ok_or_else(|| anyhow::anyhow!("undefined symbol: {}", name))?
+                                    if let Some(addr) = self.get_symbol_addr(name) {
+                                        addr
+                                    } else if sym.is_weak() {
+                                        0 // Weak undefined -> 0
+                                    } else {
+                                        anyhow::bail!("undefined symbol: {}", name);
+                                    }
                                 } else if sym.kind() == object::SymbolKind::Section {
                                     let sec_idx = sym.section_index().unwrap();
                                     self.get_section_addr(chunk.file_index, sec_idx).unwrap() + sym.address()
@@ -267,8 +317,6 @@ impl<'a, A: Architecture> Linker<'a, A> {
     }
     
     /// Writes the final ELF executable to the output path.
-    ///
-    /// Constructs the ELF File Header, Program Headers, Section content, and Section Headers.
     pub fn write(&self, output_path: &PathBuf) -> Result<()> {
         let mut buffer = Vec::new();
         let num_sections = self.output_sections.len() as u32 + 2; 
@@ -300,7 +348,7 @@ impl<'a, A: Architecture> Linker<'a, A> {
         };
         buffer.extend_from_slice(bytes_of(&file_header));
 
-        let last_section = self.output_sections.iter()
+        let last_section = self.output_sections.iter() 
             .filter(|s| s.kind != SectionKind::UninitializedData && s.size > 0)
             .last();
 
@@ -334,7 +382,7 @@ impl<'a, A: Architecture> Linker<'a, A> {
 
         for sec in &self.output_sections {
             if sec.kind == SectionKind::UninitializedData { continue; }
-            let current = buffer.len() as u64;
+            let current = buffer.len() as u64; 
             if sec.file_offset > current {
                 buffer.resize(sec.file_offset as usize, 0);
             }

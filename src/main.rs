@@ -19,18 +19,59 @@ use uld::arch::x86_64::X86_64;
 use uld::config::Config;
 use uld::linker::Linker;
 
+fn find_library(name: &str, paths: &[PathBuf]) -> Option<PathBuf> {
+    let filename = format!("lib{}.a", name);
+    for path in paths {
+        let full_path = path.join(&filename);
+        if full_path.exists() {
+            return Some(full_path);
+        }
+    }
+    None
+}
+
 fn main() -> Result<()> {
     let config = Config::parse();
     
-    // Manual parsing of arguments because clap's allow_hyphen_values captures everything
     let mut final_output = config.output;
     let mut input_paths = Vec::new();
+    let mut search_paths = Vec::new();
 
     let mut iter = config.inputs.into_iter();
     while let Some(arg) = iter.next() {
         if arg == "-o" {
             if let Some(path) = iter.next() {
                 final_output = PathBuf::from(path);
+            }
+            continue;
+        }
+        
+        if arg.starts_with("-L") {
+            if arg == "-L" {
+                if let Some(path) = iter.next() {
+                    search_paths.push(PathBuf::from(path));
+                }
+            } else {
+                search_paths.push(PathBuf::from(&arg[2..]));
+            }
+            continue;
+        }
+
+        if arg.starts_with("-l") {
+            let name = if arg == "-l" {
+                iter.next()
+            } else {
+                Some(arg[2..].to_string())
+            };
+            
+            if let Some(name) = name {
+                if let Some(path) = find_library(&name, &search_paths) {
+                    println!("Found library -l{}: {}", name, path.display());
+                    input_paths.push(path);
+                } else {
+                    println!("Warning: Library -l{} not found in search paths", name);
+                    println!("Search paths: {:?}", search_paths);
+                }
             }
             continue;
         }
@@ -55,13 +96,19 @@ fn main() -> Result<()> {
     // Map input files into memory
     let mut open_files = Vec::new();
     for path in &input_paths {
+        println!("Processing input: {}", path.display());
         let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
         let mmap = unsafe { Mmap::map(&file)? };
         
         // Architecture Check
-        let obj = object::File::parse(&*mmap).context("failed to parse object file")?;
-        if obj.architecture() != ObjArch::X86_64 {
-            anyhow::bail!("Unsupported architecture in {}: {:?}. Only X86_64 is supported.", path.display(), obj.architecture());
+        // We only check objects, skip archives for now (archives can contain objects of different arch, theoretically)
+        // But checking archive magic is better.
+        let magic = &mmap[..8.min(mmap.len())];
+        if !magic.starts_with(b"!<arch>\n") {
+             let obj = object::File::parse(&*mmap).context("failed to parse object file")?;
+             if obj.architecture() != ObjArch::X86_64 {
+                 anyhow::bail!("Unsupported architecture in {}: {:?}. Only X86_64 is supported.", path.display(), obj.architecture());
+             }
         }
 
         open_files.push((path.clone(), mmap));
