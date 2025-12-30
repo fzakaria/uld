@@ -8,10 +8,20 @@ config.suffixes = ['.c']
 
 # Source directory
 config.test_source_root = os.path.dirname(__file__)
-# Build/Output directory (same as source for now or a temp dir)
-config.test_exec_root = os.path.join(config.test_source_root, 'output')
+
+# Project root (one level up from tests/)
+project_root = os.path.abspath(os.path.join(config.test_source_root, '..'))
+
+# Build/Output directory - put in target/lit to keep repo clean
+config.test_exec_root = os.path.join(project_root, 'target', 'lit')
 
 # Substitutions
-config.substitutions.append(('%cargo_run', 'cargo run --quiet --'))
+uld_path = os.path.join(project_root, 'target', 'debug', 'uld')
+
+# Check if uld exists, warn if not (or let it fail later)
+if not os.path.exists(uld_path):
+    print(f"Warning: uld binary not found at {uld_path}. Did you run 'cargo build'?")
+
+config.substitutions.append(('%uld', uld_path))
 config.substitutions.append(('%clang', 'clang'))
 config.substitutions.append(('%filecheck', 'FileCheck'))

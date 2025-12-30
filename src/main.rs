@@ -12,6 +12,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use memmap2::Mmap;
 use std::fs::File;
+use std::path::PathBuf;
 use object::{Object, Architecture as ObjArch};
 
 use uld::arch::x86_64::X86_64;
@@ -20,18 +21,41 @@ use uld::linker::Linker;
 
 fn main() -> Result<()> {
     let config = Config::parse();
+    
+    // Manual parsing of arguments because clap's allow_hyphen_values captures everything
+    let mut final_output = config.output;
+    let mut input_paths = Vec::new();
 
-    // Map input files into memory
-    let mut open_files = Vec::new();
-    for path_str in &config.inputs {
-        if path_str.starts_with('-') {
-            // Ignore flags passed by gcc/clang that we don't support yet
-            // println!("Warning: Ignoring flag {}", path_str);
+    let mut iter = config.inputs.into_iter();
+    while let Some(arg) = iter.next() {
+        if arg == "-o" {
+            if let Some(path) = iter.next() {
+                final_output = PathBuf::from(path);
+            }
             continue;
         }
         
-        let path = std::path::PathBuf::from(path_str);
-        let file = File::open(&path).with_context(|| format!("failed to open {}", path.display()))?;
+        if arg.starts_with("-") {
+            continue; // Ignore other flags
+        }
+        
+        let path = PathBuf::from(&arg);
+        if !path.exists() {
+             // Ignore non-existent files (assumed flag args)
+             continue; 
+        }
+        
+        input_paths.push(path);
+    }
+
+    if input_paths.is_empty() {
+        anyhow::bail!("no input files");
+    }
+
+    // Map input files into memory
+    let mut open_files = Vec::new();
+    for path in &input_paths {
+        let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
         let mmap = unsafe { Mmap::map(&file)? };
         
         // Architecture Check
@@ -61,8 +85,8 @@ fn main() -> Result<()> {
     linker.relocate()?;
 
     // 5. Write final executable
-    linker.write(&config.output)?;
+    linker.write(&final_output)?;
 
-    println!("Linked successfully to {}", config.output.display());
+    println!("Linked successfully to {}", final_output.display());
     Ok(())
 }
