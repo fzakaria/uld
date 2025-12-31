@@ -1,6 +1,4 @@
 //! Entry point for the uld linker.
-//!
-//! Simple flow: parse args → load files → link → write executable.
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -20,46 +18,39 @@ fn main() -> Result<()> {
     // Initialize logging
     let filter = EnvFilter::try_from_default_env()
         .or_else(|_| EnvFilter::try_new(&config.log_level))
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+        .unwrap_or_else(|_| EnvFilter::new("warn"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
-    // Resolve inputs (handles -l, -L, -o)
-    let (output_path, input_paths) = config.resolve_inputs();
-    if input_paths.is_empty() {
+    // Parse inputs (handles -l, -L, -o in order)
+    let inputs = config.parse_inputs();
+    if inputs.files.is_empty() {
         anyhow::bail!("no input files");
     }
 
-    // Memory-map input files and verify architecture
-    let mut open_files = Vec::new();
-    for path in &input_paths {
-        info!("Processing input: {}", path.display());
+    // Memory-map and verify architecture
+    let mut mmaps = Vec::new();
+    for path in &inputs.files {
+        info!("Processing: {}", path.display());
         let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
         let mmap = unsafe { Mmap::map(&file)? };
 
-        // Verify x86_64 architecture (skip archives)
         if !mmap.starts_with(b"!<arch>\n") {
-            let obj = object::File::parse(&*mmap).context("failed to parse object file")?;
+            let obj = object::File::parse(&*mmap)?;
             if obj.architecture() != ObjArch::X86_64 {
-                anyhow::bail!(
-                    "Unsupported architecture in {}: {:?}. Only X86_64 is supported.",
-                    path.display(),
-                    obj.architecture()
-                );
+                anyhow::bail!("unsupported architecture: {:?}", obj.architecture());
             }
         }
-
-        open_files.push((path.clone(), mmap));
+        mmaps.push((path.clone(), mmap));
     }
 
     // Link
     let mut linker = Linker::new(X86_64);
-    for (path, mmap) in &open_files {
+    for (path, mmap) in &mmaps {
         linker.add_file(path.clone(), mmap)?;
     }
-    linker.layout()?;
-    linker.relocate()?;
-    linker.write(&output_path)?;
+    linker.link()?;
+    linker.write(&inputs.output)?;
 
-    info!("Linked successfully to {}", output_path.display());
+    info!("Linked: {}", inputs.output.display());
     Ok(())
 }

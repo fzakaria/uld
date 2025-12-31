@@ -1,51 +1,46 @@
-//! Configuration module.
+//! Command-line configuration.
 //!
-//! Handles command-line parsing using `clap`, including:
-//! - Input files (object files, archives)
-//! - Library search paths (-L)
-//! - Library names (-l)
-//! - Output file path (-o)
+//! When used as a linker backend (via `clang -fuse-ld=uld`), clang passes
+//! arguments in order like: `uld crt1.o -L/path -lc file.o -o out`
+//!
+//! Library order matters: `-lc` only resolves symbols from objects appearing
+//! before it. Clap can't preserve this order, so we capture all positional
+//! args and parse them ourselves.
 
 use clap::Parser;
 use std::path::PathBuf;
 use tracing::{info, warn};
 
-/// A minimal linker for x86_64 ELF binaries.
+/// A minimal static linker for x86_64 ELF binaries.
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(author, version, about)]
 pub struct Config {
-    /// Input files (object files, archives, or flags to ignore)
+    /// All arguments (files, -L, -l, -o) in order.
+    /// Order matters for library resolution.
     #[arg(required = true, allow_hyphen_values = true, num_args = 1..)]
-    pub inputs: Vec<String>,
-
-    /// Output executable path
-    #[arg(short, long, default_value = "a.out")]
-    pub output: PathBuf,
-
-    /// Library search paths (can be specified multiple times)
-    #[arg(short = 'L', action = clap::ArgAction::Append)]
-    pub library_paths: Vec<PathBuf>,
-
-    /// Libraries to link (can be specified multiple times)
-    #[arg(short = 'l', action = clap::ArgAction::Append)]
-    pub libraries: Vec<String>,
+    pub args: Vec<String>,
 
     /// Log level (error, warn, info, debug, trace)
-    #[arg(long, default_value = "debug")]
+    #[arg(long, default_value = "warn")]
     pub log_level: String,
 }
 
-impl Config {
-    /// Resolve all input files, expanding -l libraries and handling -L/-o overrides.
-    /// Returns the final output path and list of resolved input file paths.
-    pub fn resolve_inputs(&self) -> (PathBuf, Vec<PathBuf>) {
-        let mut output = self.output.clone();
-        let mut search_paths = self.library_paths.clone();
-        let mut input_paths = Vec::new();
+/// Parsed linker inputs.
+pub struct LinkerInputs {
+    pub output: PathBuf,
+    pub files: Vec<PathBuf>,
+}
 
-        let mut iter = self.inputs.iter().peekable();
+impl Config {
+    /// Parse arguments in order, resolving -l libraries against -L paths.
+    pub fn parse_inputs(&self) -> LinkerInputs {
+        let mut output = PathBuf::from("a.out");
+        let mut search_paths = Vec::new();
+        let mut files = Vec::new();
+
+        let mut iter = self.args.iter();
         while let Some(arg) = iter.next() {
-            // Handle -o override (some toolchains pass it in inputs)
+            // Output file
             if arg == "-o" {
                 if let Some(path) = iter.next() {
                     output = PathBuf::from(path);
@@ -53,68 +48,48 @@ impl Config {
                 continue;
             }
 
-            // Handle -L in inputs
-            if let Some(path) = arg.strip_prefix("-L") {
-                let path = if path.is_empty() {
-                    iter.next().map(|s| s.as_str()).unwrap_or("")
-                } else {
-                    path
-                };
-                if !path.is_empty() {
-                    search_paths.push(PathBuf::from(path));
+            // Library search path
+            if let Some(rest) = arg.strip_prefix("-L") {
+                let path = if rest.is_empty() { iter.next().map(String::as_str) } else { Some(rest) };
+                if let Some(p) = path {
+                    search_paths.push(PathBuf::from(p));
                 }
                 continue;
             }
 
-            // Handle -l in inputs
-            if let Some(name) = arg.strip_prefix("-l") {
-                let name = if name.is_empty() {
-                    iter.next().map(|s| s.as_str()).unwrap_or("")
-                } else {
-                    name
-                };
-                if let Some(path) = self.find_library(name, &search_paths) {
-                    info!("Found library -l{}: {}", name, path.display());
-                    input_paths.push(path);
-                } else if !name.is_empty() {
-                    warn!("Library -l{} not found in search paths: {:?}", name, search_paths);
+            // Library
+            if let Some(rest) = arg.strip_prefix("-l") {
+                let name = if rest.is_empty() { iter.next().map(String::as_str) } else { Some(rest) };
+                if let Some(n) = name {
+                    if let Some(path) = find_library(n, &search_paths) {
+                        info!("Found -l{}: {}", n, path.display());
+                        files.push(path);
+                    } else {
+                        warn!("Library -l{} not found in {:?}", n, search_paths);
+                    }
                 }
                 continue;
             }
 
-            // Skip unknown flags
+            // Skip other flags
             if arg.starts_with('-') {
                 continue;
             }
 
-            // Regular file path
+            // Regular file
             let path = PathBuf::from(arg);
             if path.exists() {
-                input_paths.push(path);
+                files.push(path);
             }
         }
 
-        // Also resolve libraries from -l flags
-        for name in &self.libraries {
-            if let Some(path) = self.find_library(name, &search_paths) {
-                info!("Found library -l{}: {}", name, path.display());
-                input_paths.push(path);
-            } else {
-                warn!("Library -l{} not found in search paths: {:?}", name, search_paths);
-            }
-        }
-
-        (output, input_paths)
+        LinkerInputs { output, files }
     }
+}
 
-    fn find_library(&self, name: &str, search_paths: &[PathBuf]) -> Option<PathBuf> {
-        let filename = format!("lib{}.a", name);
-        for path in search_paths {
-            let full_path = path.join(&filename);
-            if full_path.exists() {
-                return Some(full_path);
-            }
-        }
-        None
-    }
+fn find_library(name: &str, search_paths: &[PathBuf]) -> Option<PathBuf> {
+    let filename = format!("lib{}.a", name);
+    search_paths.iter()
+        .map(|p| p.join(&filename))
+        .find(|p| p.exists())
 }

@@ -1,41 +1,106 @@
-# uld - A Minimal Rust Linker
+# uld - A Minimal Rust Static Linker
 
-`uld` is a minimal linker written in Rust for educational purposes. It targets **x86_64 Linux ELF** binaries.
-
-## Design Philosophy
-
-*   **Minimalism**: We focus on the core logic of linking (resolution, layout, relocation) without the burden of supporting every legacy feature or architecture.
-*   **Educational**: The code is structured to be readable and understandable.
-*   **"Dumb"**: We assume modern defaults (e.g., `BIND_NOW`) and do not perform complex relaxations or optimizations.
-*   **Safety**: Written in Safe Rust where possible (using `object` crate for parsing).
+`uld` is a minimal static linker written in Rust for educational purposes. It targets **x86_64 Linux ELF** binaries.
 
 ## Features
 
-*   **ELF64 x86_64** support.
-*   **Static Linking** of object files.
-*   **Symbol Resolution**: Handles global/weak symbols.
-*   **Relocations**: Supports `R_X86_64_64`, `R_X86_64_PC32`, `R_X86_64_PLT32`.
-*   **Layout**: Maps `.text`, `.rodata`, `.data`, `.bss` sections.
+- **Static linking** of object files (`.o`) and archives (`.a`)
+- **musl libc** support for fully static executables
+- **Works as a clang backend** via `-fuse-ld=/path/to/uld`
+- **Symbol resolution**: global, weak, and local symbols
+- **Relocations**: `R_X86_64_64`, `R_X86_64_PC32`, `R_X86_64_PLT32`, `R_X86_64_GOT*`
+- **GOT (Global Offset Table)** generation
+- **Selective archive linking**: only pulls in needed members
 
-## Building and Running
+## Design Philosophy
+
+- **Minimalism**: Core linking logic without legacy cruft
+- **Educational**: Code is structured to be readable
+- **Static-only**: No dynamic linking, no PLT trampolines
+- **Safe Rust**: Uses `object` crate for parsing, safe code throughout
+
+## Building
 
 ```bash
 cargo build
 ```
 
-To link object files:
+## Usage
 
+### Direct invocation
 ```bash
-cargo run -- -o output_binary file1.o file2.o
+./target/debug/uld -o output crt1.o crti.o main.o -L/path -lc crtn.o
 ```
 
-## Structure
+### Via clang driver (recommended)
+```bash
+# Compile and link a static binary using musl-clang
+musl-clang -fuse-ld=/path/to/uld -static -o hello hello.c
+```
 
-*   `src/arch`: Architecture-specific logic (relocations).
-*   `src/linker.rs`: Core linking orchestration.
-*   `src/layout.rs`: Output section layout.
-*   `src/symbol.rs`: Symbol table definitions.
+## Project Structure
+
+```
+src/
+├── main.rs      # Entry point
+├── config.rs    # CLI argument handling
+├── linker.rs    # Core linking: load → layout → relocate
+├── symbol.rs    # Symbol table management
+├── layout.rs    # Section/Segment structures
+├── arch/        # Architecture-specific relocation handling
+│   └── x86_64.rs
+├── writer.rs    # ELF output generation
+└── utils.rs     # Utilities (alignment)
+```
+
+### Linking Phases
+
+1. **Load**: Parse object files and archives, build symbol table
+2. **Layout**: Map sections into segments, assign virtual addresses
+3. **Resolve**: Compute final address for each symbol
+4. **Relocate**: Patch code/data with resolved addresses
+5. **Write**: Generate ELF executable
 
 ## Testing
 
-This project uses Python-based integration tests (simulating `lit`) to compile C code and link it with `uld`.
+Uses [LLVM lit](https://llvm.org/docs/CommandGuide/lit.html) for integration tests:
+
+```bash
+# Run all tests
+lit tests/
+
+# Run with verbose output
+lit tests/ -v
+```
+
+### Test Categories
+
+| Test | Description |
+|------|-------------|
+| `exit_42.s` | Minimal assembly, syscall exit |
+| `function_call.s` | Assembly function calls |
+| `c_return_42.c` | Basic C with custom start.s |
+| `libc_printf.c` | C with musl libc (manual CRT) |
+| `libc_printf_clang_driver.c` | C via clang driver |
+| `recursive_fib.c` | Recursive functions |
+| `large_bss_array.c` | Large BSS arrays |
+| `string_ops.c` | String operations |
+| `argc_argv.c` | Command-line arguments |
+
+## Requirements
+
+- Rust (stable)
+- musl-clang (for libc tests)
+- LLVM lit and FileCheck (for running tests)
+
+## Limitations
+
+- x86_64 Linux only
+- No dynamic linking
+- No debug info (DWARF)
+- No linker scripts
+- No LTO
+
+## License
+
+MIT
