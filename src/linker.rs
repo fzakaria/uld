@@ -10,7 +10,7 @@
 use anyhow::{Context, Result, anyhow};
 use memmap2::Mmap;
 use object::read::{Object, ObjectSection, RelocationTarget, SectionIndex};
-use object::{ObjectSymbol, SectionKind, RelocationKind, SymbolKind};
+use object::{ObjectSymbol, SectionKind, RelocationKind, SymbolKind, SymbolVisibility};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
@@ -20,25 +20,6 @@ use crate::utils::align_up;
 use crate::writer;
 
 const PAGE_SIZE: u64 = 0x1000;
-
-// ELF x86_64 relocation types not mapped by object crate
-const R_X86_64_GOTPCRELX: u32 = 41;
-const R_X86_64_REX_GOTPCRELX: u32 = 42;
-
-/// Check if a relocation requires a GOT entry (handles GOTPCRELX variants).
-fn is_got_relocation(reloc: &object::read::Relocation) -> bool {
-    match reloc.kind() {
-        RelocationKind::Got | RelocationKind::GotRelative => return true,
-        _ => {}
-    }
-    // Check raw ELF flags for GOTPCRELX variants
-    if let object::RelocationFlags::Elf { r_type } = reloc.flags() {
-        if r_type == R_X86_64_GOTPCRELX || r_type == R_X86_64_REX_GOTPCRELX {
-            return true;
-        }
-    }
-    false
-}
 const BASE_ADDR: u64 = 0x400000;
 
 /// Representation of a symbol defined in one of the input object files.
@@ -107,14 +88,12 @@ impl<'a, A: Architecture> Linker<'a, A> {
     fn is_stub_symbol(&self, name: &str, sym: Option<&object::Symbol>) -> bool {
         if let Some(s) = sym {
             if s.is_weak() { return true; }
-            if let object::SymbolFlags::Elf { st_other, .. } = s.flags() {
-                if (st_other & 0x03) == 2 { return true; }
-            }
+            if s.visibility() == SymbolVisibility::Hidden { return true; }
             if s.kind() == SymbolKind::Tls && s.is_undefined() { return true; }
         }
 
-        name.starts_with("__TMC_") 
-            || name.starts_with("__bid_") 
+        name.starts_with("__TMC_")
+            || name.starts_with("__bid_")
             || name.starts_with("__gcc_")
             || name.starts_with("__morestack")
             || name == "__dso_handle"
@@ -205,7 +184,7 @@ impl<'a, A: Architecture> Linker<'a, A> {
         for obj in &self.input_objects {
             for section in obj.sections() {
                 for (_, reloc) in section.relocations() {
-                    let mut needs_got = is_got_relocation(&reloc);
+                    let mut needs_got = matches!(reloc.kind(), RelocationKind::Got | RelocationKind::GotRelative);
 
                     // Also check for TLS symbols
                     if !needs_got {
@@ -330,8 +309,9 @@ impl<'a, A: Architecture> Linker<'a, A> {
                                 let sym = obj.symbol_by_index(idx)?;
                                 let name = sym.name()?;
 
-                                // Check for GOT usage (handles GOTPCRELX variants) or TLS
-                                let use_got = is_got_relocation(&reloc) || sym.kind() == SymbolKind::Tls;
+                                // Check for GOT-relative relocations or TLS
+                                let use_got = matches!(reloc.kind(), RelocationKind::Got | RelocationKind::GotRelative)
+                                    || sym.kind() == SymbolKind::Tls;
 
                                 if use_got {
                                     let g_offset = self.got_map.get(name).cloned().context("GOT entry missing")?;

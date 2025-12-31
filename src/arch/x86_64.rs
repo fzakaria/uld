@@ -5,11 +5,7 @@
 use super::Architecture;
 use anyhow::{anyhow, Result};
 use object::read::Relocation;
-use object::{Endianness, RelocationFlags, RelocationKind};
-
-// ELF x86_64 relocation types not mapped by object crate
-const R_X86_64_GOTPCRELX: u32 = 41;
-const R_X86_64_REX_GOTPCRELX: u32 = 42;
+use object::{Endianness, RelocationKind};
 
 /// The x86_64 architecture backend.
 pub struct X86_64;
@@ -35,47 +31,33 @@ impl Architecture for X86_64 {
         // which can sometimes appear in specific toolchains or object formats.
         let mut final_addend = a;
         if final_addend == 0 && reloc.size() == 32 {
-             if offset + 4 <= data.len() {
-                let existing = i32::from_le_bytes(data[offset..offset+4].try_into().unwrap());
+            if offset + 4 <= data.len() {
+                let existing = i32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
                 if existing != 0 {
                     final_addend = existing as i64;
                 }
-             }
+            }
         }
-
-        // Check for GOTPCRELX variants using raw ELF flags
-        let is_gotpcrelx = matches!(
-            reloc.flags(),
-            RelocationFlags::Elf { r_type } if r_type == R_X86_64_GOTPCRELX || r_type == R_X86_64_REX_GOTPCRELX
-        );
 
         let val: u64 = match reloc.kind() {
             // R_X86_64_64: S + A
             RelocationKind::Absolute => (s as i64 + final_addend) as u64,
 
-            // R_X86_64_PC32 / PLT32 / GOTPCREL: S + A - P
-            RelocationKind::Relative | RelocationKind::PltRelative | RelocationKind::GotRelative => {
-                (s as i64 + final_addend - p as i64) as u64
-            }
+            // R_X86_64_PC32 / PLT32 / GOTPCREL / GOTPCRELX: S + A - P
+            RelocationKind::Relative
+            | RelocationKind::PltRelative
+            | RelocationKind::GotRelative => (s as i64 + final_addend - p as i64) as u64,
+
             _ => {
-                // Handle GOTPCRELX variants (same calculation as GOTPCREL)
-                if is_gotpcrelx {
-                    (s as i64 + final_addend - p as i64) as u64
-                } else {
-                    tracing::trace!("Unsupported relocation kind: {:?}", reloc.kind());
-                    return Ok(());
-                }
+                tracing::trace!("Unsupported relocation kind: {:?}", reloc.kind());
+                return Ok(());
             }
         };
 
-        // Determine relocation size - GOTPCRELX returns 0 from object crate, but is 32-bit
-        let size = if reloc.size() == 0 && is_gotpcrelx { 32 } else { reloc.size() };
-
         // Write the value to the buffer.
-        match size {
+        match reloc.size() {
             32 => {
                 // x86_64 PC-relative displacements are signed 32-bit integers.
-                // We check if the calculated value fits in the signed 32-bit range.
                 let signed_val = val as i64;
                 if signed_val < i32::MIN as i64 || signed_val > i32::MAX as i64 {
                     return Err(anyhow!(
@@ -89,7 +71,10 @@ impl Architecture for X86_64 {
                 if offset + 4 <= data.len() {
                     data[offset..offset + 4].copy_from_slice(&bytes);
                 } else {
-                    return Err(anyhow!("Relocation offset out of bounds at 0x{:x}", offset));
+                    return Err(anyhow!(
+                        "Relocation offset out of bounds at 0x{:x}",
+                        offset
+                    ));
                 }
             }
             64 => {
@@ -97,7 +82,10 @@ impl Architecture for X86_64 {
                 if offset + 8 <= data.len() {
                     data[offset..offset + 8].copy_from_slice(&bytes);
                 } else {
-                    return Err(anyhow!("Relocation offset out of bounds at 0x{:x}", offset));
+                    return Err(anyhow!(
+                        "Relocation offset out of bounds at 0x{:x}",
+                        offset
+                    ));
                 }
             }
             _ => return Err(anyhow!("Unsupported relocation size: {}", reloc.size())),
