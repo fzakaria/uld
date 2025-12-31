@@ -44,6 +44,8 @@ pub struct Linker<'a, A: Architecture> {
     output_sections: Vec<OutputSection>,
     /// Map (Object Index, SectionIndex) -> (OutputSectionIndex, Offset within OutputSection).
     section_map: HashMap<(usize, SectionIndex), (usize, u64)>,
+    /// Map Symbol Name -> Offset in .got section.
+    got_map: HashMap<String, u64>,
 }
 
 impl<'a, A: Architecture> Linker<'a, A> {
@@ -56,6 +58,7 @@ impl<'a, A: Architecture> Linker<'a, A> {
             symbol_table: HashMap::new(),
             output_sections: Vec::new(),
             section_map: HashMap::new(),
+            got_map: HashMap::new(),
         }
     }
 
@@ -200,10 +203,34 @@ impl<'a, A: Architecture> Linker<'a, A> {
             }
         }
         
-        // Resize .got to hold synthetic symbols (size 0x100)
+        // Scan for GOT entries
+        let mut got_offset = 0;
+        for (_file_index, obj) in self.input_objects.iter().enumerate() {
+            for section in obj.sections() {
+                for (_, reloc) in section.relocations() {
+                    match reloc.kind() {
+                        object::RelocationKind::Got | object::RelocationKind::GotRelative => {
+                            if let RelocationTarget::Symbol(idx) = reloc.target() {
+                                if let Ok(sym) = obj.symbol_by_index(idx) {
+                                    if let Ok(name) = sym.name() {
+                                        if !self.got_map.contains_key(name) {
+                                            self.got_map.insert(name.to_string(), got_offset);
+                                            got_offset += 8;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // Resize .got
         let got_sec = &mut self.output_sections[4];
-        got_sec.size = 0x100;
-        got_sec.data.resize(0x100, 0);
+        got_sec.size = got_offset;
+        got_sec.data.resize(got_offset as usize, 0);
 
         let mut current_va = BASE_ADDR + PAGE_SIZE; 
         let mut current_file_offset = PAGE_SIZE; 
@@ -232,21 +259,38 @@ impl<'a, A: Architecture> Linker<'a, A> {
         Ok(())
     }
 
+    fn fill_got(&mut self) -> Result<()> {
+        // Need to clone map keys/values to iterate while mutating self
+        let got_entries: Vec<(String, u64)> = self.got_map.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        
+        let mut updates = Vec::new();
+        for (name, offset) in &got_entries {
+            let addr = if let Some(a) = self.get_symbol_addr(name) {
+                a
+            } else {
+                0
+            };
+            updates.push((*offset, addr));
+        }
+
+        let got_data = &mut self.output_sections[4].data;
+        for (offset, addr) in updates {
+            let bytes = addr.to_le_bytes();
+            let off = offset as usize;
+            if off + 8 <= got_data.len() {
+                got_data[off..off+8].copy_from_slice(&bytes);
+            }
+        }
+        Ok(())
+    }
+
     fn get_symbol_addr(&self, name: &str) -> Option<u64> {
         let got_va = self.output_sections[4].virtual_address;
         if name == "_GLOBAL_OFFSET_TABLE_" { return Some(got_va); }
-        if name == "__morestack_initial_sp" { return Some(got_va + 8); }
-        if name == "__morestack_current_segment" { return Some(got_va + 16); }
-        if name == "__bid_IDEC_glbflags" { return Some(got_va + 24); }
-        if name == "__bid_IDEC_glbround" { return Some(got_va + 32); }
-        if name == "__TMC_END__" { return Some(got_va + 40); }
         
-        if name == "_dl_find_object" {
-            return Some(0); // Function, assuming not called or weak check?
+        if name == "_dl_find_object" || name == "__TMC_END__" || name.starts_with("__bid_") || name.starts_with("__morestack") {
+            return Some(0);
         }
-        // Handle __bid_ prefix generally if needed, or specific ones above.
-        if name.starts_with("__bid_") { return Some(got_va + 48); }
-        if name.starts_with("__morestack") { return Some(got_va + 56); }
 
         let sym = self.symbol_table.get(name)?;
         let (out_sec_idx, offset) = self.section_map.get(&(sym.input_file_index, sym.section_index))?;
@@ -260,6 +304,8 @@ impl<'a, A: Architecture> Linker<'a, A> {
 
     /// Applies relocations to the output sections.
     pub fn relocate(&mut self) -> Result<()> {
+        self.fill_got()?;
+
         for out_sec_idx in 0..self.output_sections.len() {
             let mut patches = Vec::new();
             
@@ -274,7 +320,38 @@ impl<'a, A: Architecture> Linker<'a, A> {
                         let target_va = match reloc.target() {
                             RelocationTarget::Symbol(idx) => {
                                 let sym = obj.symbol_by_index(idx)?;
-                                if sym.is_undefined() {
+                                if reloc.kind() == object::RelocationKind::GotRelative {
+                                    let name = sym.name()?;
+                                    if let Some(got_offset) = self.got_map.get(name) {
+                                        let got_va = self.output_sections[4].virtual_address;
+                                        // Relaxation Check: If we can relax (MOV 0x8b), we use symbol value.
+                                        // Otherwise we use GOT entry address.
+                                        // We need to check the instruction at offset.
+                                        // The section data is in `obj.section_by_index...`. 
+                                        // But we are iterating it. `section.data()`?
+                                        let s_data = section.data()?;
+                                        let r_offset = offset as usize;
+                                        let is_relaxable = if r_offset >= 2 && s_data[r_offset - 2] == 0x8b {
+                                            true
+                                        } else {
+                                            false
+                                        };
+
+                                        if is_relaxable {
+                                            // Relaxing: Use symbol value
+                                            if let Some(addr) = self.get_symbol_addr(name) {
+                                                addr
+                                            } else {
+                                                0
+                                            }
+                                        } else {
+                                            // Not relaxing: Use GOT entry address
+                                            got_va + got_offset
+                                        }
+                                    } else {
+                                        anyhow::bail!("GOT entry not found for {}", name);
+                                    }
+                                } else if sym.is_undefined() {
                                     let name = sym.name()?;
                                     if let Some(addr) = self.get_symbol_addr(name) {
                                         addr
