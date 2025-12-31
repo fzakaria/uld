@@ -22,6 +22,6 @@ pub struct Config {
     pub output: PathBuf,
 
     /// Log level (error, warn, info, debug, trace)
-    #[arg(long, default_value = "info", help = "Set the logging level")]
+    #[arg(long, default_value = "debug", help = "Set the logging level")]
     pub log_level: String,
 }

@@ -1,51 +1,51 @@
 //! Layout management.
 //!
 //! This module defines the structures for organizing the output executable's memory layout.
-//! It maps chunks of code/data from input files into aggregated output sections (e.g., .text, .data).
+//! It maps sections from input files into aggregated segments (e.g., .text, .data).
 
 use object::read::SectionIndex;
 use object::SectionKind;
 
-/// Represents a piece of code or data from an input file.
+/// Represents a section from an input file.
 ///
-/// An `InputChunk` corresponds to a section from an object file that will be copied
-/// into a specific `OutputSection`.
-pub struct InputChunk {
+/// A `Section` corresponds to a section from an object file that will be copied
+/// into a specific `Segment`.
+pub struct Section {
     /// Index of the input file.
     pub file_index: usize,
     /// Index of the section in the input file.
     pub section_index: SectionIndex,
-    /// The offset where this chunk starts within the `OutputSection`.
+    /// The offset where this section starts within the `Segment`.
     pub offset: u64, 
 }
 
-/// Represents a section in the final output executable.
+/// Represents a segment in the final output executable.
 ///
-/// An `OutputSection` aggregates multiple `InputChunk`s of the same type (e.g., all .text sections).
+/// A `Segment` aggregates multiple input `Section`s of the same type (e.g., all .text sections).
 /// It tracks the total size, the virtual address where it will be loaded, and the raw data bytes.
-pub struct OutputSection {
-    /// Name of the section (e.g., ".text", ".data").
+pub struct Segment {
+    /// Name of the segment (e.g., ".text", ".data").
     pub name: String,
-    /// List of input chunks that make up this section.
-    pub chunks: Vec<InputChunk>,
-    /// Total size of the section in bytes.
+    /// List of input sections that make up this segment.
+    pub sections: Vec<Section>,
+    /// Total size of the segment in bytes.
     pub size: u64,
-    /// The virtual address where this section starts in memory.
+    /// The virtual address where this segment starts in memory.
     pub virtual_address: u64,
-    /// The file offset where this section starts in the ELF file.
+    /// The file offset where this segment starts in the ELF file.
     pub file_offset: u64,
-    /// The raw data content of the section.
+    /// The raw data content of the segment.
     pub data: Vec<u8>, 
-    /// The kind of section (Text, Data, etc.) used for permissions and mapping.
+    /// The kind of segment (Text, Data, etc.) used for permissions and mapping.
     pub kind: SectionKind,
 }
 
-impl OutputSection {
-    /// Creates a new, empty output section.
+impl Segment {
+    /// Creates a new, empty segment.
     pub fn new(name: &str, kind: SectionKind) -> Self {
         Self {
             name: name.to_string(),
-            chunks: Vec::new(),
+            sections: Vec::new(),
             size: 0,
             virtual_address: 0,
             file_offset: 0,

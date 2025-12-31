@@ -3,7 +3,7 @@
 //! This module contains the `Linker` struct which orchestrates the entire linking process:
 //! 1. Input Loading: Reads object files (and Archives).
 //! 2. Symbol Resolution: Builds a global symbol table.
-//! 3. Layout: Maps input sections to output sections and assigns virtual addresses.
+//! 3. Layout: Maps input sections to output segments and assigns virtual addresses.
 //! 4. Relocation: Applies patches to code/data based on symbol addresses.
 //! 5. Output: Writes the final ELF executable.
 
@@ -18,8 +18,9 @@ use std::path::PathBuf;
 use std::os::unix::fs::PermissionsExt;
 
 use crate::arch::Architecture;
-use crate::layout::{InputChunk, OutputSection};
+use crate::layout::{Section, Segment};
 use crate::symbol::DefinedSymbol;
+use crate::utils::align_up;
 
 // Constants for x86_64 Linux memory layout
 const PAGE_SIZE: u64 = 0x1000;
@@ -40,11 +41,11 @@ pub struct Linker<'a, A: Architecture> {
     input_paths: Vec<String>,
     /// Global symbol table: Name -> Definition.
     symbol_table: HashMap<String, DefinedSymbol>,
-    /// List of output sections (.text, .data, etc.).
-    output_sections: Vec<OutputSection>,
-    /// Map (Object Index, SectionIndex) -> (OutputSectionIndex, Offset within OutputSection).
+    /// List of output segments (.text, .data, etc.).
+    segments: Vec<Segment>,
+    /// Map (Object Index, SectionIndex) -> (SegmentIndex, Offset within Segment).
     section_map: HashMap<(usize, SectionIndex), (usize, u64)>,
-    /// Map Symbol Name -> Offset in .got section.
+    /// Map Symbol Name -> Offset in .got segment.
     got_map: HashMap<String, u64>,
 }
 
@@ -56,7 +57,7 @@ impl<'a, A: Architecture> Linker<'a, A> {
             input_objects: Vec::new(),
             input_paths: Vec::new(),
             symbol_table: HashMap::new(),
-            output_sections: Vec::new(),
+            segments: Vec::new(),
             section_map: HashMap::new(),
             got_map: HashMap::new(),
         }
@@ -74,7 +75,7 @@ impl<'a, A: Architecture> Linker<'a, A> {
                  
                  // Handle alignment for ELF parsing
                  let obj = if data.as_ptr().align_offset(8) != 0 {
-                     // If misaligned (common in archives), we must copy.
+                     // If misaligned (common in archives), we must copy to aligned memory.
                      let vec = data.to_vec();
                      let leaked: &'a [u8] = Box::leak(vec.into_boxed_slice());
                      object::File::parse(leaked).context("failed to parse archive member (aligned copy)")?
@@ -110,7 +111,7 @@ impl<'a, A: Architecture> Linker<'a, A> {
                     // Ignore weak if strong exists
                     continue; 
                 } else if !existing.is_weak && !is_weak {
-                     // anyhow::bail!("duplicate symbol: {{}} in {{}}", name, path);
+                     // anyhow::bail!("duplicate symbol: {} in {}", name, path);
                 }
             }
 
@@ -120,6 +121,16 @@ impl<'a, A: Architecture> Linker<'a, A> {
                     section_index,
                     value: sym.address(),
                     is_weak,
+                    is_absolute: false,
+                });
+            } else {
+                 // No section index means it's an absolute symbol (or something special)
+                 self.symbol_table.insert(name.to_string(), DefinedSymbol {
+                    input_file_index: file_index,
+                    section_index: SectionIndex(0), 
+                    value: sym.address(),
+                    is_weak,
+                    is_absolute: true,
                 });
             }
         }
@@ -139,7 +150,10 @@ impl<'a, A: Architecture> Linker<'a, A> {
                     if sym.is_weak() {
                         continue;
                     }
-                    if name == "_GLOBAL_OFFSET_TABLE_" || name == "_dl_find_object" || name == "__TMC_END__" || name.starts_with("__bid_") || name.starts_with("__morestack") {
+                    // Handle runtime symbols provided by the linker or dummy stubs
+                    if name == "_GLOBAL_OFFSET_TABLE_" || name == "_dl_find_object" || name == "_DYNAMIC" || name == "__TMC_END__" || 
+                       name.starts_with("__bid_") || name.starts_with("__morestack") || name.starts_with("_ITM_") || name.starts_with("__real_") ||
+                       name.contains("_array_start") || name.contains("_array_end") {
                         continue;
                     }
                     if !self.symbol_table.contains_key(name) {
@@ -151,13 +165,13 @@ impl<'a, A: Architecture> Linker<'a, A> {
         Ok(())
     }
 
-    /// Lays out the output sections.
+    /// Lays out the output segments.
     pub fn layout(&mut self) -> Result<()> {
-        self.output_sections.push(OutputSection::new(".text", SectionKind::Text));
-        self.output_sections.push(OutputSection::new(".rodata", SectionKind::ReadOnlyData));
-        self.output_sections.push(OutputSection::new(".data", SectionKind::Data));
-        self.output_sections.push(OutputSection::new(".bss", SectionKind::UninitializedData));
-        self.output_sections.push(OutputSection::new(".got", SectionKind::Data));
+        self.segments.push(Segment::new(".text", SectionKind::Text));
+        self.segments.push(Segment::new(".rodata", SectionKind::ReadOnlyData));
+        self.segments.push(Segment::new(".data", SectionKind::Data));
+        self.segments.push(Segment::new(".bss", SectionKind::UninitializedData));
+        self.segments.push(Segment::new(".got", SectionKind::Data));
 
         for (file_index, obj) in self.input_objects.iter().enumerate() {
             for section in obj.sections() {
@@ -167,45 +181,60 @@ impl<'a, A: Architecture> Linker<'a, A> {
                 let align = section.align();
                 let kind = section.kind();
                 
-                let output_idx = match kind {
+                let segment_idx = match kind {
                     SectionKind::Text => 0,
                     SectionKind::ReadOnlyData | SectionKind::ReadOnlyString => 1,
                     SectionKind::Data => 2,
                     SectionKind::UninitializedData => 3,
-                    _ => continue,
+                    _ => {
+                        let name = section.name().unwrap_or("");
+                        if name == ".init" || name == ".fini" {
+                            0
+                        } else if name == ".init_array" || name == ".fini_array" || name == ".preinit_array" {
+                            2
+                        } else if name == ".eh_frame" || name == ".eh_frame_hdr" || name == ".gcc_except_table" || name.starts_with(".note") {
+                            1
+                        } else if kind == SectionKind::Other || kind == SectionKind::Note {
+                            1
+                        } else {
+                            tracing::trace!("Skipping section {} of kind {:?}", name, kind);
+                            continue;
+                        }
+                    }
                 };
 
-                let out_sec = &mut self.output_sections[output_idx];
+                let segment = &mut self.segments[segment_idx];
                 
-                let current_size = out_sec.size;
-                let padding = if current_size % align != 0 {
-                    align - (current_size % align)
-                } else {
-                    0
-                };
+                let start_offset = align_up(segment.size, align);
+                let padding = start_offset - segment.size;
+                segment.size += padding + size;
                 
-                let start_offset = current_size + padding;
-                out_sec.size += padding + size;
-                
-                if out_sec.kind != SectionKind::UninitializedData {
-                    out_sec.data.resize(start_offset as usize, 0);
+                if segment.kind != SectionKind::UninitializedData {
+                    segment.data.resize(start_offset as usize, 0);
                     let data = section.data()?;
-                    out_sec.data.extend_from_slice(data);
+                    segment.data.extend_from_slice(data);
                 }
 
-                out_sec.chunks.push(InputChunk {
+                segment.sections.push(Section {
                     file_index,
                     section_index: section.index(),
                     offset: start_offset,
                 });
                 
-                self.section_map.insert((file_index, section.index()), (output_idx, start_offset));
+                self.section_map.insert((file_index, section.index()), (segment_idx, start_offset));
             }
         }
         
         // Scan for GOT entries
-        let mut got_offset = 0;
-        for (_file_index, obj) in self.input_objects.iter().enumerate() {
+        let mut current_got_offset = 0;
+        
+        // Reserve 16 bytes for a dummy _DYNAMIC at the start of GOT
+        if !self.got_map.contains_key("_DYNAMIC") {
+            self.got_map.insert("_DYNAMIC".to_string(), current_got_offset);
+            current_got_offset += 16;
+        }
+
+        for obj in &self.input_objects {
             for section in obj.sections() {
                 for (_, reloc) in section.relocations() {
                     match reloc.kind() {
@@ -214,8 +243,8 @@ impl<'a, A: Architecture> Linker<'a, A> {
                                 if let Ok(sym) = obj.symbol_by_index(idx) {
                                     if let Ok(name) = sym.name() {
                                         if !self.got_map.contains_key(name) {
-                                            self.got_map.insert(name.to_string(), got_offset);
-                                            got_offset += 8;
+                                            self.got_map.insert(name.to_string(), current_got_offset);
+                                            current_got_offset += 8;
                                         }
                                     }
                                 }
@@ -227,53 +256,42 @@ impl<'a, A: Architecture> Linker<'a, A> {
             }
         }
 
-        // Resize .got
-        let got_sec = &mut self.output_sections[4];
-        got_sec.size = got_offset;
-        got_sec.data.resize(got_offset as usize, 0);
+        // Resize .got segment
+        let got_seg = &mut self.segments[4];
+        got_seg.size = current_got_offset;
+        got_seg.data.resize(current_got_offset as usize, 0);
 
         let mut current_va = BASE_ADDR + PAGE_SIZE; 
         let mut current_file_offset = PAGE_SIZE; 
         
-        for section in &mut self.output_sections {
-            if section.size == 0 { continue; }
+        for segment in &mut self.segments {
+            if segment.size == 0 { continue; }
             
-             if current_va % PAGE_SIZE != 0 {
-                let pad = PAGE_SIZE - (current_va % PAGE_SIZE);
-                current_va += pad;
-                current_file_offset += pad;
-            }
+            current_va = align_up(current_va, PAGE_SIZE);
+            current_file_offset = align_up(current_file_offset, PAGE_SIZE);
 
-            section.virtual_address = current_va;
+            segment.virtual_address = current_va;
+            segment.file_offset = current_file_offset;
             
-            if section.kind != SectionKind::UninitializedData {
-                section.file_offset = current_file_offset;
-                current_file_offset += section.size;
-            } else {
-                 section.file_offset = current_file_offset; 
+            if segment.kind != SectionKind::UninitializedData {
+                current_file_offset += segment.size;
             }
             
-            current_va += section.size;
+            current_va += segment.size;
         }
 
         Ok(())
     }
 
     fn fill_got(&mut self) -> Result<()> {
-        // Need to clone map keys/values to iterate while mutating self
-        let got_entries: Vec<(String, u64)> = self.got_map.iter().map(|(k, v)| (k.clone(), *v)).collect();
-        
+        // Collect updates first to satisfy borrow checker
         let mut updates = Vec::new();
-        for (name, offset) in &got_entries {
-            let addr = if let Some(a) = self.get_symbol_addr(name) {
-                a
-            } else {
-                0
-            };
+        for (name, offset) in &self.got_map {
+            let addr = self.get_symbol_addr(name).unwrap_or(0);
             updates.push((*offset, addr));
         }
 
-        let got_data = &mut self.output_sections[4].data;
+        let got_data = &mut self.segments[4].data;
         for (offset, addr) in updates {
             let bytes = addr.to_le_bytes();
             let off = offset as usize;
@@ -285,112 +303,94 @@ impl<'a, A: Architecture> Linker<'a, A> {
     }
 
     fn get_symbol_addr(&self, name: &str) -> Option<u64> {
-        let got_va = self.output_sections[4].virtual_address;
+        let got_va = self.segments[4].virtual_address;
         if name == "_GLOBAL_OFFSET_TABLE_" { return Some(got_va); }
         
-        if name == "_dl_find_object" || name == "__TMC_END__" || name.starts_with("__bid_") || name.starts_with("__morestack") {
+        if let Some(got_offset) = self.got_map.get(name) {
+            if name == "_DYNAMIC" {
+                return Some(got_va + got_offset);
+            }
+        }
+        
+        // Dummy values for missing runtime symbols to allow linking
+        if name == "_dl_find_object" || name == "__TMC_END__" || 
+           name.starts_with("__bid_") || name.starts_with("__morestack") || name.starts_with("_ITM_") || name.starts_with("__real_") ||
+           name.contains("_array_start") || name.contains("_array_end") {
             return Some(0);
         }
 
         let sym = self.symbol_table.get(name)?;
-        let (out_sec_idx, offset) = self.section_map.get(&(sym.input_file_index, sym.section_index))?;
-        Some(self.output_sections[*out_sec_idx].virtual_address + offset + sym.value)
+        if sym.is_absolute {
+            return Some(sym.value);
+        }
+        let (seg_idx, offset) = self.section_map.get(&(sym.input_file_index, sym.section_index))?;
+        Some(self.segments[*seg_idx].virtual_address + offset + sym.value)
     }
 
     fn get_section_addr(&self, file_index: usize, section_index: SectionIndex) -> Option<u64> {
-        let (out_sec_idx, offset) = self.section_map.get(&(file_index, section_index))?;
-        Some(self.output_sections[*out_sec_idx].virtual_address + offset)
+        let (seg_idx, offset) = self.section_map.get(&(file_index, section_index))?;
+        Some(self.segments[*seg_idx].virtual_address + offset)
     }
 
-    /// Applies relocations to the output sections.
+    /// Applies relocations to the output segments.
     pub fn relocate(&mut self) -> Result<()> {
         self.fill_got()?;
 
-        for out_sec_idx in 0..self.output_sections.len() {
+        for seg_idx in 0..self.segments.len() {
             let mut patches = Vec::new();
             
             {
-                let out_sec = &self.output_sections[out_sec_idx];
-                for chunk in &out_sec.chunks {
-                    let obj = &self.input_objects[chunk.file_index];
-                    let section = obj.section_by_index(chunk.section_index)?;
-                    let chunk_va = out_sec.virtual_address + chunk.offset;
+                let segment = &self.segments[seg_idx];
+                for input_section in &segment.sections {
+                    let obj = &self.input_objects[input_section.file_index];
+                    let section = obj.section_by_index(input_section.section_index)?;
+                    let section_va = segment.virtual_address + input_section.offset;
 
                     for (offset, reloc) in section.relocations() {
                         let target_va = match reloc.target() {
                             RelocationTarget::Symbol(idx) => {
                                 let sym = obj.symbol_by_index(idx)?;
-                                if reloc.kind() == object::RelocationKind::GotRelative {
+                                let res = if reloc.kind() == object::RelocationKind::GotRelative {
                                     let name = sym.name()?;
-                                    if let Some(got_offset) = self.got_map.get(name) {
-                                        let got_va = self.output_sections[4].virtual_address;
-                                        // Relaxation Check: If we can relax (MOV 0x8b), we use symbol value.
-                                        // Otherwise we use GOT entry address.
-                                        // We need to check the instruction at offset.
-                                        // The section data is in `obj.section_by_index...`. 
-                                        // But we are iterating it. `section.data()`?
-                                        let s_data = section.data()?;
-                                        let r_offset = offset as usize;
-                                        let is_relaxable = if r_offset >= 2 && s_data[r_offset - 2] == 0x8b {
-                                            true
-                                        } else {
-                                            false
-                                        };
-
-                                        if is_relaxable {
-                                            // Relaxing: Use symbol value
-                                            if let Some(addr) = self.get_symbol_addr(name) {
-                                                addr
-                                            } else {
-                                                0
-                                            }
-                                        } else {
-                                            // Not relaxing: Use GOT entry address
-                                            got_va + got_offset
-                                        }
-                                    } else {
-                                        anyhow::bail!("GOT entry not found for {}", name);
-                                    }
+                                    let got_offset = self.got_map.get(name).cloned().context("GOT entry missing")?;
+                                    let got_va = self.segments[4].virtual_address;
+                                    got_va + got_offset
                                 } else if sym.is_undefined() {
                                     let name = sym.name()?;
-                                    if let Some(addr) = self.get_symbol_addr(name) {
-                                        addr
-                                    } else if sym.is_weak() {
-                                        0 // Weak undefined -> 0
-                                    } else {
-                                        anyhow::bail!("undefined symbol: {}", name);
-                                    }
+                                    self.get_symbol_addr(name).context(format!("undefined symbol: {}", name))?
                                 } else if sym.kind() == object::SymbolKind::Section {
                                     let sec_idx = sym.section_index().unwrap();
-                                    self.get_section_addr(chunk.file_index, sec_idx).unwrap_or(0) + sym.address()
+                                    self.get_section_addr(input_section.file_index, sec_idx).unwrap_or(0) + sym.address()
                                 } else if sym.is_local() {
                                      if let Some(sec_idx) = sym.section_index() {
-                                         self.get_section_addr(chunk.file_index, sec_idx).unwrap_or(0) + sym.address()
+                                         self.get_section_addr(input_section.file_index, sec_idx).unwrap_or(0) + sym.address()
                                      } else {
                                          sym.address()
                                      }
                                 } else {
                                      let name = sym.name()?;
-                                     self.get_symbol_addr(name).ok_or_else(|| anyhow::anyhow!("undefined symbol: {}", name))?
-                                }
+                                     self.get_symbol_addr(name).context(format!("undefined symbol: {}", name))?
+                                };
+                                tracing::trace!("Relocation at {:x} target symbol {} VA {:x}", section_va + offset, sym.name().unwrap_or("?"), res);
+                                res
                             }
                             RelocationTarget::Section(sec_idx) => {
-                                self.get_section_addr(chunk.file_index, sec_idx).unwrap_or(0)
+                                let res = self.get_section_addr(input_section.file_index, sec_idx).unwrap_or(0);
+                                tracing::trace!("Relocation at {:x} target section {:?} VA {:x}", section_va + offset, sec_idx, res);
+                                res
                             }
                             _ => continue,
                         };
 
-                        patches.push((chunk.offset + offset, reloc, chunk_va + offset, target_va));
+                        patches.push((input_section.offset + offset, reloc, section_va + offset, target_va));
                     }
                 }
             }
             
-            let out_sec_data = &mut self.output_sections[out_sec_idx].data;
+            let segment_data = &mut self.segments[seg_idx].data;
             for (offset, reloc, p, s) in patches {
                 let addend = reloc.addend(); 
-                let a = addend as i64;
-
-                self.arch.apply_relocation(offset, &reloc, p, s, a, out_sec_data)?;
+                self.arch.apply_relocation(offset, &reloc, p, s, addend, segment_data)?;
             }
         }
         Ok(())
@@ -399,7 +399,7 @@ impl<'a, A: Architecture> Linker<'a, A> {
     /// Writes the final ELF executable to the output path.
     pub fn write(&self, output_path: &PathBuf) -> Result<()> {
         let mut buffer = Vec::new();
-        let num_sections = self.output_sections.len() as u32 + 2; 
+        let num_sections = self.segments.len() as u32 + 2; 
 
         // Write File Header
         let file_header = object::elf::FileHeader64::<Endianness> {
@@ -428,17 +428,17 @@ impl<'a, A: Architecture> Linker<'a, A> {
         };
         buffer.extend_from_slice(bytes_of(&file_header));
 
-        let last_section = self.output_sections.iter() 
+        let last_segment = self.segments.iter() 
             .filter(|s| s.kind != SectionKind::UninitializedData && s.size > 0)
             .last();
 
-        let file_size = if let Some(sec) = last_section {
-                sec.file_offset + sec.size
+        let file_size = if let Some(seg) = last_segment {
+                seg.file_offset + seg.size
         } else {
                 PAGE_SIZE
         };
         
-        let mem_size = self.output_sections.iter()
+        let mem_size = self.segments.iter()
             .map(|s| if s.virtual_address > 0 { s.virtual_address + s.size } else { BASE_ADDR })
             .max().unwrap_or(BASE_ADDR) - BASE_ADDR;
 
@@ -455,18 +455,17 @@ impl<'a, A: Architecture> Linker<'a, A> {
         buffer.extend_from_slice(bytes_of(&prog_header));
 
         // Pad to PAGE_SIZE
-        let current_len = buffer.len(); 
-        if current_len < PAGE_SIZE as usize {
+        if (buffer.len() as u64) < PAGE_SIZE {
             buffer.resize(PAGE_SIZE as usize, 0);
         }
 
-        for sec in &self.output_sections {
-            if sec.kind == SectionKind::UninitializedData { continue; }
+        for segment in &self.segments {
+            if segment.kind == SectionKind::UninitializedData { continue; }
             let current = buffer.len() as u64; 
-            if sec.file_offset > current {
-                buffer.resize(sec.file_offset as usize, 0);
+            if segment.file_offset > current {
+                buffer.resize(segment.file_offset as usize, 0);
             }
-            buffer.extend_from_slice(&sec.data);
+            buffer.extend_from_slice(&segment.data);
         }
         
         // Build shstrtab
@@ -475,10 +474,10 @@ impl<'a, A: Architecture> Linker<'a, A> {
         let mut section_name_offsets = Vec::new();
         section_name_offsets.push(0);
         
-        for sec in &self.output_sections {
+        for segment in &self.segments {
             let off = shstrtab.len();
             section_name_offsets.push(off);
-            shstrtab.extend_from_slice(sec.name.as_bytes());
+            shstrtab.extend_from_slice(segment.name.as_bytes());
             shstrtab.push(0);
         }
         
@@ -503,19 +502,19 @@ impl<'a, A: Architecture> Linker<'a, A> {
         };
         buffer.extend_from_slice(bytes_of(&null_sec));
         
-        for (i, sec) in self.output_sections.iter().enumerate() {
+        for (i, segment) in self.segments.iter().enumerate() {
             let sec_header = object::elf::SectionHeader64::<Endianness> {
                 sh_name: u32(section_name_offsets[i+1] as u32),
-                sh_type: u32(if sec.kind == SectionKind::UninitializedData { object::elf::SHT_NOBITS } else { object::elf::SHT_PROGBITS }),
-                sh_flags: u64(match sec.kind {
+                sh_type: u32(if segment.kind == SectionKind::UninitializedData { object::elf::SHT_NOBITS } else { object::elf::SHT_PROGBITS }),
+                sh_flags: u64(match segment.kind {
                     SectionKind::Text => object::elf::SHF_ALLOC | object::elf::SHF_EXECINSTR,
                     SectionKind::Data => object::elf::SHF_ALLOC | object::elf::SHF_WRITE,
                     SectionKind::UninitializedData => object::elf::SHF_ALLOC | object::elf::SHF_WRITE,
                     _ => object::elf::SHF_ALLOC,
                 } as u64),
-                sh_addr: u64(sec.virtual_address),
-                sh_offset: u64(sec.file_offset),
-                sh_size: u64(sec.size),
+                sh_addr: u64(segment.virtual_address),
+                sh_offset: u64(segment.file_offset),
+                sh_size: u64(segment.size),
                 sh_link: u32(0),
                 sh_info: u32(0),
                 sh_addralign: u64(16),

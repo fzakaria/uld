@@ -16,8 +16,10 @@ pub struct DefinedSymbol {
     pub input_file_index: usize,
     /// Index of the section within that input file.
     pub section_index: SectionIndex,
-    /// The value of the symbol relative to the section start.
+    /// The value of the symbol relative to the section start (or absolute VA if is_absolute is true).
     pub value: u64,
     /// Whether the symbol is weak (can be overridden by a strong symbol).
     pub is_weak: bool,
+    /// Whether the symbol is absolute (not relative to any section).
+    pub is_absolute: bool,
 }
