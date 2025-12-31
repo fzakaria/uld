@@ -36,7 +36,7 @@
         pkgs.devshell.mkShell {
           language.rust = let
             rust-toolchain = {
-              toolchain = (pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml);
+              toolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
             };
           in {
             packageSet = rust-toolchain;
@@ -44,11 +44,19 @@
               "toolchain"
             ];
           };
-          
-          packages = with pkgs; [
+
+          packages = with pkgs; let
+            clang-with-musl = wrapCCWith {
+              cc = llvmPackages.clang-unwrapped;
+              bintools = pkgs.wrapBintoolsWith {
+                bintools = llvmPackages.bintools;
+                libc = pkgs.musl;
+              };
+            };
+          in [
             libllvm
             lit
-            clang
+            clang-with-musl
           ];
 
           imports = [
