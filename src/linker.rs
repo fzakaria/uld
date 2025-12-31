@@ -7,50 +7,50 @@
 //! 4. Relocation: Applies patches to code/data based on symbol addresses.
 //! 5. Output: Writes the final ELF executable.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use memmap2::Mmap;
 use object::read::{Object, ObjectSection, RelocationTarget, SectionIndex};
-use object::{ObjectSymbol, SectionKind, Endianness};
+use object::{ObjectSymbol, SectionKind, Endianness, RelocationKind, SymbolKind};
 use object::endian::{U16, U32, U64};
 use object::pod::bytes_of;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::os::unix::fs::PermissionsExt;
 
 use crate::arch::Architecture;
 use crate::layout::{Section, Segment};
-use crate::symbol::DefinedSymbol;
 use crate::utils::align_up;
 
-// Constants for x86_64 Linux memory layout
 const PAGE_SIZE: u64 = 0x1000;
 const BASE_ADDR: u64 = 0x400000; 
 
-// Helpers for Endianness types
 fn u16(v: u16) -> U16<Endianness> { U16::new(Endianness::Little, v) }
 fn u32(v: u32) -> U32<Endianness> { U32::new(Endianness::Little, v) }
 fn u64(v: u64) -> U64<Endianness> { U64::new(Endianness::Little, v) }
 
-/// The main Linker struct.
+/// Representation of a symbol defined in one of the input object files.
+pub struct DefinedSymbol {
+    pub input_file_index: usize,
+    pub section_index: SectionIndex,
+    pub value: u64,
+    pub is_weak: bool,
+    pub is_absolute: bool,
+}
+
 pub struct Linker<'a, A: Architecture> {
-    /// The target architecture backend.
     arch: A,
-    /// List of parsed objects.
     input_objects: Vec<object::File<'a>>,
-    /// Original path for each object (for error reporting).
     input_paths: Vec<String>,
-    /// Global symbol table: Name -> Definition.
     symbol_table: HashMap<String, DefinedSymbol>,
-    /// List of output segments (.text, .data, etc.).
     segments: Vec<Segment>,
-    /// Map (Object Index, SectionIndex) -> (SegmentIndex, Offset within Segment).
     section_map: HashMap<(usize, SectionIndex), (usize, u64)>,
-    /// Map Symbol Name -> Offset in .got segment.
     got_map: HashMap<String, u64>,
+    /// Symbols that are allowed to remain undefined (Weak, Hidden, or Internal Markers) 
+    /// in a static binary, resolving to address 0.
+    allowed_undefined: HashSet<String>,
 }
 
 impl<'a, A: Architecture> Linker<'a, A> {
-    /// Creates a new Linker instance for a specific architecture.
     pub fn new(arch: A) -> Self {
         Self {
             arch,
@@ -60,10 +60,10 @@ impl<'a, A: Architecture> Linker<'a, A> {
             segments: Vec::new(),
             section_map: HashMap::new(),
             got_map: HashMap::new(),
+            allowed_undefined: HashSet::new(),
         }
     }
 
-    /// Adds a file (Object or Archive) to the linker.
     pub fn add_file(&mut self, path: PathBuf, mmap: &'a Mmap) -> Result<()> {
         let magic = &mmap[..8.min(mmap.len())];
         if magic.starts_with(b"!<arch>\n") {
@@ -72,17 +72,13 @@ impl<'a, A: Architecture> Linker<'a, A> {
                  let member = member?;
                  let name = String::from_utf8_lossy(member.name()).to_string();
                  let data = member.data(&**mmap)?;
-                 
-                 // Handle alignment for ELF parsing
                  let obj = if data.as_ptr().align_offset(8) != 0 {
-                     // If misaligned (common in archives), we must copy to aligned memory.
                      let vec = data.to_vec();
                      let leaked: &'a [u8] = Box::leak(vec.into_boxed_slice());
-                     object::File::parse(leaked).context("failed to parse archive member (aligned copy)")?
+                     object::File::parse(leaked).context("failed to parse archive member")?
                  } else {
                      object::File::parse(data).context("failed to parse archive member")?
                  };
-                 
                  let member_path = format!("{}({})", path.display(), name);
                  self.process_object(member_path, obj)?;
              }
@@ -93,26 +89,41 @@ impl<'a, A: Architecture> Linker<'a, A> {
         Ok(())
     }
 
+    /// Check if a symbol is a compiler-internal marker or optional feature
+    /// that should resolve to address 0 if not defined.
+    fn is_stub_symbol(&self, name: &str, sym: Option<&object::Symbol>) -> bool {
+        if let Some(s) = sym {
+            if s.is_weak() { return true; }
+            if let object::SymbolFlags::Elf { st_other, .. } = s.flags() {
+                if (st_other & 0x03) == 2 { return true; }
+            }
+            if s.kind() == SymbolKind::Tls && s.is_undefined() { return true; }
+        }
+
+        name.starts_with("__TMC_") 
+            || name.starts_with("__bid_") 
+            || name.starts_with("__gcc_")
+            || name.starts_with("__morestack")
+            || name == "__dso_handle"
+            || name == "_DYNAMIC"
+            || name == "_dl_find_object"
+    }
+
     fn process_object(&mut self, path: String, obj: object::File<'a>) -> Result<()> {
         let file_index = self.input_objects.len();
-        
         for sym in obj.symbols() {
-            if sym.is_undefined() || sym.is_local() {
+            let name = sym.name()?;
+            if sym.is_undefined() {
+                if self.is_stub_symbol(name, Some(&sym)) {
+                    self.allowed_undefined.insert(name.to_string());
+                }
                 continue;
             }
 
-            let name = sym.name().context("failed to parse symbol name")?;
+            if sym.is_local() { continue; }
             let is_weak = sym.is_weak();
-            
             if let Some(existing) = self.symbol_table.get(name) {
-                if existing.is_weak && !is_weak {
-                    // Upgrade weak to strong
-                } else if !existing.is_weak && is_weak {
-                    // Ignore weak if strong exists
-                    continue; 
-                } else if !existing.is_weak && !is_weak {
-                     // anyhow::bail!("duplicate symbol: {} in {}", name, path);
-                }
+                if !is_weak && existing.is_weak { /* overwrite */ } else { continue; }
             }
 
             if let Some(section_index) = sym.section_index() {
@@ -124,7 +135,6 @@ impl<'a, A: Architecture> Linker<'a, A> {
                     is_absolute: false,
                 });
             } else {
-                 // No section index means it's an absolute symbol (or something special)
                  self.symbol_table.insert(name.to_string(), DefinedSymbol {
                     input_file_index: file_index,
                     section_index: SectionIndex(0), 
@@ -134,211 +144,161 @@ impl<'a, A: Architecture> Linker<'a, A> {
                 });
             }
         }
-
         self.input_objects.push(obj);
         self.input_paths.push(path);
         Ok(())
     }
 
-    /// Verifies that all undefined symbols in input files are resolved by the global symbol table.
-    pub fn verify_unresolved(&self) -> Result<()> {
-        for (i, obj) in self.input_objects.iter().enumerate() {
-            for sym in obj.symbols() {
-                if sym.is_undefined() {
-                    let name = sym.name().unwrap_or("<unparsable>");
-                    // Weak undefined symbols are allowed (value 0).
-                    if sym.is_weak() {
-                        continue;
-                    }
-                    // Handle runtime symbols provided by the linker or dummy stubs
-                    if name == "_GLOBAL_OFFSET_TABLE_" || name == "_dl_find_object" || name == "_DYNAMIC" || name == "__TMC_END__" || 
-                       name.starts_with("__bid_") || name.starts_with("__morestack") || name.starts_with("_ITM_") || name.starts_with("__real_") ||
-                       name.contains("_array_start") || name.contains("_array_end") {
-                        continue;
-                    }
-                    if !self.symbol_table.contains_key(name) {
-                        anyhow::bail!("undefined reference: {} in {}", name, self.input_paths[i]);
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Lays out the output segments.
     pub fn layout(&mut self) -> Result<()> {
         self.segments.push(Segment::new(".text", SectionKind::Text));
         self.segments.push(Segment::new(".rodata", SectionKind::ReadOnlyData));
         self.segments.push(Segment::new(".data", SectionKind::Data));
         self.segments.push(Segment::new(".bss", SectionKind::UninitializedData));
         self.segments.push(Segment::new(".got", SectionKind::Data));
+        self.segments.push(Segment::new(".tdata", SectionKind::Tls)); // Map TLS symbols
 
         for (file_index, obj) in self.input_objects.iter().enumerate() {
             for section in obj.sections() {
                 let size = section.size();
                 if size == 0 { continue; }
-
-                let align = section.align();
                 let kind = section.kind();
-                
                 let segment_idx = match kind {
                     SectionKind::Text => 0,
                     SectionKind::ReadOnlyData | SectionKind::ReadOnlyString => 1,
                     SectionKind::Data => 2,
                     SectionKind::UninitializedData => 3,
-                    _ => {
-                        let name = section.name().unwrap_or("");
-                        if name == ".init" || name == ".fini" {
-                            0
-                        } else if name == ".init_array" || name == ".fini_array" || name == ".preinit_array" {
-                            2
-                        } else if name == ".eh_frame" || name == ".eh_frame_hdr" || name == ".gcc_except_table" || name.starts_with(".note") {
-                            1
-                        } else if kind == SectionKind::Other || kind == SectionKind::Note {
-                            1
-                        } else {
-                            tracing::trace!("Skipping section {} of kind {:?}", name, kind);
-                            continue;
-                        }
-                    }
+                    SectionKind::Tls => 5, // Keep TLS sections
+                    _ => continue,
                 };
-
                 let segment = &mut self.segments[segment_idx];
-                
-                let start_offset = align_up(segment.size, align);
-                let padding = start_offset - segment.size;
-                segment.size += padding + size;
-                
+                let start_offset = align_up(segment.size, section.align().max(1));
+                segment.size = start_offset + size;
                 if segment.kind != SectionKind::UninitializedData {
                     segment.data.resize(start_offset as usize, 0);
-                    let data = section.data()?;
-                    segment.data.extend_from_slice(data);
+                    segment.data.extend_from_slice(section.data()?);
                 }
-
-                segment.sections.push(Section {
-                    file_index,
-                    section_index: section.index(),
-                    offset: start_offset,
-                });
-                
+                segment.sections.push(Section { file_index, section_index: section.index(), offset: start_offset });
                 self.section_map.insert((file_index, section.index()), (segment_idx, start_offset));
             }
         }
         
-        // Scan for GOT entries
-        let mut current_got_offset = 0;
-        
-        // Reserve 16 bytes for a dummy _DYNAMIC at the start of GOT
-        if !self.got_map.contains_key("_DYNAMIC") {
-            self.got_map.insert("_DYNAMIC".to_string(), current_got_offset);
-            current_got_offset += 16;
-        }
-
+        let mut got_offset = 0;
         for obj in &self.input_objects {
             for section in obj.sections() {
                 for (_, reloc) in section.relocations() {
+                    let mut needs_got = false;
                     match reloc.kind() {
-                        object::RelocationKind::Got | object::RelocationKind::GotRelative => {
+                        RelocationKind::Got | RelocationKind::GotRelative => needs_got = true,
+                        _ => {
                             if let RelocationTarget::Symbol(idx) = reloc.target() {
                                 if let Ok(sym) = obj.symbol_by_index(idx) {
-                                    if let Ok(name) = sym.name() {
-                                        if !self.got_map.contains_key(name) {
-                                            self.got_map.insert(name.to_string(), current_got_offset);
-                                            current_got_offset += 8;
-                                        }
+                                    if sym.kind() == SymbolKind::Tls {
+                                        needs_got = true;
                                     }
                                 }
                             }
                         }
-                        _ => {}
+                    }
+
+                    if needs_got {
+                        if let RelocationTarget::Symbol(idx) = reloc.target() {
+                            let sym = obj.symbol_by_index(idx)?;
+                            let name = sym.name()?;
+                            if !self.got_map.contains_key(name) {
+                                self.got_map.insert(name.to_string(), got_offset);
+                                got_offset += 8;
+                            }
+                        }
                     }
                 }
             }
         }
-
-        // Resize .got segment
-        let got_seg = &mut self.segments[4];
-        got_seg.size = current_got_offset;
-        got_seg.data.resize(current_got_offset as usize, 0);
-
-        let mut current_va = BASE_ADDR + PAGE_SIZE; 
-        let mut current_file_offset = PAGE_SIZE; 
         
-        for segment in &mut self.segments {
-            if segment.size == 0 { continue; }
-            
-            current_va = align_up(current_va, PAGE_SIZE);
-            current_file_offset = align_up(current_file_offset, PAGE_SIZE);
-
-            segment.virtual_address = current_va;
-            segment.file_offset = current_file_offset;
-            
-            if segment.kind != SectionKind::UninitializedData {
-                current_file_offset += segment.size;
-            }
-            
-            current_va += segment.size;
+        if let Some(got_seg) = self.segments.iter_mut().find(|s| s.name == ".got") {
+            got_seg.size = got_offset;
+            got_seg.data.resize(got_offset as usize, 0);
         }
 
+        let mut current_va = BASE_ADDR + PAGE_SIZE;
+        let mut current_off = PAGE_SIZE;
+        for segment in &mut self.segments {
+            if segment.size == 0 { continue; }
+            current_va = align_up(current_va, PAGE_SIZE);
+            current_off = align_up(current_off, PAGE_SIZE);
+            segment.virtual_address = current_va;
+            segment.file_offset = current_off;
+            current_va += segment.size;
+            if segment.kind != SectionKind::UninitializedData {
+                current_off += segment.size;
+            }
+        }
+        Ok(())
+    }
+
+    fn resolve_symbol_va(&self, file_index: usize, sym: &object::Symbol) -> Result<u64> {
+        if sym.kind() == SymbolKind::Section {
+            let sec_idx = sym.section_index().context("section symbol without index")?;
+            return Ok(self.get_section_addr(file_index, sec_idx).unwrap_or(0));
+        }
+
+        if sym.is_local() {
+            if let Some(sec_idx) = sym.section_index() {
+                let base = self.get_section_addr(file_index, sec_idx).unwrap_or(0);
+                return Ok(base + sym.address());
+            }
+            return Ok(sym.address());
+        }
+
+        let name = sym.name()?;
+        if let Some(addr) = self.get_symbol_addr(name) {
+            return Ok(addr);
+        }
+
+        Err(anyhow!(
+            "symbol missing: name={}, file={}",
+            name, self.input_paths[file_index]
+        ))
+    }
+
+    fn verify_unresolved(&self) -> Result<()> {
+        for (file_idx, obj) in self.input_objects.iter().enumerate() {
+            for section in obj.sections() {
+                for (_, reloc) in section.relocations() {
+                    if let RelocationTarget::Symbol(idx) = reloc.target() {
+                        let sym = obj.symbol_by_index(idx)?;
+                        let name = sym.name()?;
+                        if sym.is_undefined() && !self.is_stub_symbol(name, Some(&sym)) {
+                            self.resolve_symbol_va(file_idx, &sym)?;
+                        }
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
     fn fill_got(&mut self) -> Result<()> {
-        // Collect updates first to satisfy borrow checker
         let mut updates = Vec::new();
         for (name, offset) in &self.got_map {
             let addr = self.get_symbol_addr(name).unwrap_or(0);
             updates.push((*offset, addr));
         }
-
-        let got_data = &mut self.segments[4].data;
-        for (offset, addr) in updates {
-            let bytes = addr.to_le_bytes();
-            let off = offset as usize;
-            if off + 8 <= got_data.len() {
-                got_data[off..off+8].copy_from_slice(&bytes);
+        if let Some(got_seg) = self.segments.iter_mut().find(|s| s.name == ".got") {
+            for (offset, addr) in updates {
+                let bytes = addr.to_le_bytes();
+                got_seg.data[offset as usize..offset as usize + 8].copy_from_slice(&bytes);
             }
         }
         Ok(())
     }
 
-    fn get_symbol_addr(&self, name: &str) -> Option<u64> {
-        let got_va = self.segments[4].virtual_address;
-        if name == "_GLOBAL_OFFSET_TABLE_" { return Some(got_va); }
-        
-        if let Some(got_offset) = self.got_map.get(name) {
-            if name == "_DYNAMIC" {
-                return Some(got_va + got_offset);
-            }
-        }
-        
-        // Dummy values for missing runtime symbols to allow linking
-        if name == "_dl_find_object" || name == "__TMC_END__" || 
-           name.starts_with("__bid_") || name.starts_with("__morestack") || name.starts_with("_ITM_") || name.starts_with("__real_") ||
-           name.contains("_array_start") || name.contains("_array_end") {
-            return Some(0);
-        }
-
-        let sym = self.symbol_table.get(name)?;
-        if sym.is_absolute {
-            return Some(sym.value);
-        }
-        let (seg_idx, offset) = self.section_map.get(&(sym.input_file_index, sym.section_index))?;
-        Some(self.segments[*seg_idx].virtual_address + offset + sym.value)
-    }
-
-    fn get_section_addr(&self, file_index: usize, section_index: SectionIndex) -> Option<u64> {
-        let (seg_idx, offset) = self.section_map.get(&(file_index, section_index))?;
-        Some(self.segments[*seg_idx].virtual_address + offset)
-    }
-
-    /// Applies relocations to the output segments.
     pub fn relocate(&mut self) -> Result<()> {
+        self.verify_unresolved()?;
         self.fill_got()?;
+        let got_va = self.segments.iter().find(|s| s.name == ".got").map(|s| s.virtual_address).unwrap_or(0);
 
         for seg_idx in 0..self.segments.len() {
             let mut patches = Vec::new();
-            
             {
                 let segment = &self.segments[seg_idx];
                 for input_section in &segment.sections {
@@ -350,34 +310,21 @@ impl<'a, A: Architecture> Linker<'a, A> {
                         let target_va = match reloc.target() {
                             RelocationTarget::Symbol(idx) => {
                                 let sym = obj.symbol_by_index(idx)?;
-                                let res = if reloc.kind() == object::RelocationKind::GotRelative {
-                                    let name = sym.name()?;
-                                    let got_offset = self.got_map.get(name).cloned().context("GOT entry missing")?;
-                                    let got_va = self.segments[4].virtual_address;
-                                    got_va + got_offset
-                                } else if sym.is_undefined() {
-                                    let name = sym.name()?;
-                                    self.get_symbol_addr(name).context(format!("undefined symbol: {}", name))?
-                                } else if sym.kind() == object::SymbolKind::Section {
-                                    let sec_idx = sym.section_index().unwrap();
-                                    self.get_section_addr(input_section.file_index, sec_idx).unwrap_or(0) + sym.address()
-                                } else if sym.is_local() {
-                                     if let Some(sec_idx) = sym.section_index() {
-                                         self.get_section_addr(input_section.file_index, sec_idx).unwrap_or(0) + sym.address()
-                                     } else {
-                                         sym.address()
-                                     }
+                                let name = sym.name()?;
+                                let kind = reloc.kind();
+                                
+                                // Check for GOT usage (Standard GOT or TLS targeting)
+                                let use_got = kind == RelocationKind::Got || kind == RelocationKind::GotRelative || sym.kind() == SymbolKind::Tls;
+
+                                if use_got {
+                                    let g_offset = self.got_map.get(name).cloned().context("GOT entry missing")?;
+                                    got_va + g_offset
                                 } else {
-                                     let name = sym.name()?;
-                                     self.get_symbol_addr(name).context(format!("undefined symbol: {}", name))?
-                                };
-                                tracing::trace!("Relocation at {:x} target symbol {} VA {:x}", section_va + offset, sym.name().unwrap_or("?"), res);
-                                res
+                                    self.resolve_symbol_va(input_section.file_index, &sym)?
+                                }
                             }
                             RelocationTarget::Section(sec_idx) => {
-                                let res = self.get_section_addr(input_section.file_index, sec_idx).unwrap_or(0);
-                                tracing::trace!("Relocation at {:x} target section {:?} VA {:x}", section_va + offset, sec_idx, res);
-                                res
+                                self.get_section_addr(input_section.file_index, sec_idx).unwrap_or(0)
                             }
                             _ => continue,
                         };
@@ -388,20 +335,45 @@ impl<'a, A: Architecture> Linker<'a, A> {
             }
             
             let segment_data = &mut self.segments[seg_idx].data;
-            for (offset, reloc, p, s) in patches {
+            for (off, reloc, p, s) in patches {
                 let addend = reloc.addend(); 
-                self.arch.apply_relocation(offset, &reloc, p, s, addend, segment_data)?;
+                self.arch.apply_relocation(off, &reloc, p, s, addend, segment_data)?;
             }
         }
         Ok(())
     }
+
+    fn get_symbol_addr(&self, name: &str) -> Option<u64> {
+        if name == "_GLOBAL_OFFSET_TABLE_" { 
+            return self.segments.iter().find(|s| s.name == ".got").map(|s| s.virtual_address);
+        }
+        
+        // 1. ALWAYS check the symbol table first.
+        // If a symbol is defined, we must use its real address.
+        if let Some(sym) = self.symbol_table.get(name) {
+            if sym.is_absolute { return Some(sym.value); }
+            if let Some((seg_idx, off)) = self.section_map.get(&(sym.input_file_index, sym.section_index)) {
+                return Some(self.segments[*seg_idx].virtual_address + off + sym.value);
+            }
+        }
+
+        // 2. Only if the symbol is NOT in the table, check if it's an allowed undefined stub.
+        if self.allowed_undefined.contains(name) || self.is_stub_symbol(name, None) {
+            return Some(0);
+        }
+
+        None
+    }
+
+    fn get_section_addr(&self, file_index: usize, section_index: SectionIndex) -> Option<u64> {
+        let (seg_idx, offset) = self.section_map.get(&(file_index, section_index))?;
+        Some(self.segments[*seg_idx].virtual_address + offset)
+    }
     
-    /// Writes the final ELF executable to the output path.
     pub fn write(&self, output_path: &PathBuf) -> Result<()> {
         let mut buffer = Vec::new();
         let num_sections = self.segments.len() as u32 + 2; 
 
-        // Write File Header
         let file_header = object::elf::FileHeader64::<Endianness> {
             e_ident: object::elf::Ident {
                 magic: object::elf::ELFMAG,
@@ -454,7 +426,6 @@ impl<'a, A: Architecture> Linker<'a, A> {
         };
         buffer.extend_from_slice(bytes_of(&prog_header));
 
-        // Pad to PAGE_SIZE
         if (buffer.len() as u64) < PAGE_SIZE {
             buffer.resize(PAGE_SIZE as usize, 0);
         }
@@ -468,7 +439,6 @@ impl<'a, A: Architecture> Linker<'a, A> {
             buffer.extend_from_slice(&segment.data);
         }
         
-        // Build shstrtab
         let mut shstrtab = Vec::new();
         shstrtab.push(0); 
         let mut section_name_offsets = Vec::new();
@@ -487,7 +457,6 @@ impl<'a, A: Architecture> Linker<'a, A> {
         
         let shoff = buffer.len(); 
         
-        // 0: Null
         let null_sec = object::elf::SectionHeader64::<Endianness> {
             sh_name: u32(0),
             sh_type: u32(object::elf::SHT_NULL),

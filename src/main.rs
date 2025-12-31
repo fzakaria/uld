@@ -132,16 +132,13 @@ fn main() -> Result<()> {
         linker.add_file(path.clone(), mmap)?;
     }
 
-    // 2. Verify all symbols are resolved
-    linker.verify_unresolved()?;
-
-    // 3. Layout sections in memory
+    // 2. Layout sections in memory
     linker.layout()?;
 
-    // 4. Apply relocations
+    // 3. Apply relocations
     linker.relocate()?;
 
-    // 5. Write final executable
+    // 4. Write final executable
     linker.write(&final_output)?;
 
     info!("Linked successfully to {}", final_output.display());
