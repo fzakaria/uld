@@ -32,3 +32,9 @@ config.substitutions.append(('%as', 'as'))
 config.substitutions.append(('%start', os.path.join(support_dir, 'start.s')))
 config.substitutions.append(('%helper', os.path.join(support_dir, 'c_helper.c')))
 config.substitutions.append(('%filecheck', 'filecheck'))
+
+# musl libc CRT files for static linking
+config.substitutions.append(('%crt1', '/usr/x86_64-linux-musl/lib64/crt1.o'))
+config.substitutions.append(('%crti', '/usr/x86_64-linux-musl/lib64/crti.o'))
+config.substitutions.append(('%crtn', '/usr/x86_64-linux-musl/lib64/crtn.o'))
+config.substitutions.append(('%libc', '/usr/x86_64-linux-musl/lib64/libc.a'))

@@ -39,9 +39,11 @@ pub struct Linker<'a, A: Architecture> {
     segments: Vec<Segment>,
     section_map: HashMap<(usize, SectionIndex), (usize, u64)>,
     got_map: HashMap<String, u64>,
-    /// Symbols that are allowed to remain undefined (Weak, Hidden, or Internal Markers) 
+    /// Symbols that are allowed to remain undefined (Weak, Hidden, or Internal Markers)
     /// in a static binary, resolving to address 0.
     allowed_undefined: HashSet<String>,
+    /// Symbols that are currently undefined (needed but not yet resolved)
+    undefined_symbols: HashSet<String>,
 }
 
 impl<'a, A: Architecture> Linker<'a, A> {
@@ -55,31 +57,77 @@ impl<'a, A: Architecture> Linker<'a, A> {
             section_map: HashMap::new(),
             got_map: HashMap::new(),
             allowed_undefined: HashSet::new(),
+            undefined_symbols: HashSet::new(),
         }
     }
 
     pub fn add_file(&mut self, path: PathBuf, mmap: &'a Mmap) -> Result<()> {
         let magic = &mmap[..8.min(mmap.len())];
         if magic.starts_with(b"!<arch>\n") {
-             let archive = object::read::archive::ArchiveFile::parse(&**mmap)?;
-             for member in archive.members() {
-                 let member = member?;
-                 let name = String::from_utf8_lossy(member.name()).to_string();
-                 let data = member.data(&**mmap)?;
-                 let obj = if data.as_ptr().align_offset(8) != 0 {
-                     let vec = data.to_vec();
-                     let leaked: &'a [u8] = Box::leak(vec.into_boxed_slice());
-                     object::File::parse(leaked).context("failed to parse archive member")?
-                 } else {
-                     object::File::parse(data).context("failed to parse archive member")?
-                 };
-                 let member_path = format!("{}({})", path.display(), name);
-                 self.process_object(member_path, obj)?;
-             }
+            self.add_archive(path, mmap)?;
         } else {
              let obj = object::File::parse(&**mmap).context("failed to parse object file")?;
              self.process_object(path.display().to_string(), obj)?;
         }
+        Ok(())
+    }
+
+    /// Add an archive with selective linking - only include members that satisfy undefined references.
+    fn add_archive(&mut self, path: PathBuf, mmap: &'a Mmap) -> Result<()> {
+        let archive = object::read::archive::ArchiveFile::parse(&**mmap)?;
+
+        // Build an index: symbol name -> (member name, member data)
+        let mut symbol_to_member: HashMap<String, (String, &'a [u8])> = HashMap::new();
+        for member in archive.members() {
+            let member = member?;
+            let name = String::from_utf8_lossy(member.name()).to_string();
+            let data = member.data(&**mmap)?;
+
+            // Handle alignment - leak if needed
+            let data: &'a [u8] = if data.as_ptr().align_offset(8) != 0 {
+                let vec = data.to_vec();
+                Box::leak(vec.into_boxed_slice())
+            } else {
+                data
+            };
+
+            // Parse to find what symbols this member defines
+            if let Ok(obj) = object::File::parse(data) {
+                for sym in obj.symbols() {
+                    if let Ok(sym_name) = sym.name() {
+                        if !sym.is_undefined() && !sym.is_local() {
+                            symbol_to_member.insert(sym_name.to_string(), (name.clone(), data));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Keep adding members until no more undefined symbols can be resolved
+        let mut included: HashSet<String> = HashSet::new();
+        loop {
+            let mut added_any = false;
+            let undefined: Vec<String> = self.undefined_symbols.iter().cloned().collect();
+
+            for sym_name in undefined {
+                if let Some((member_name, data)) = symbol_to_member.get(&sym_name) {
+                    if included.contains(member_name) {
+                        continue;
+                    }
+                    included.insert(member_name.clone());
+
+                    let obj = object::File::parse(*data)?;
+                    let member_path = format!("{}({})", path.display(), member_name);
+                    self.process_object(member_path, obj)?;
+                    added_any = true;
+                }
+            }
+
+            if !added_any {
+                break;
+            }
+        }
+
         Ok(())
     }
 
@@ -108,6 +156,9 @@ impl<'a, A: Architecture> Linker<'a, A> {
             if sym.is_undefined() {
                 if self.is_stub_symbol(name, Some(&sym)) {
                     self.allowed_undefined.insert(name.to_string());
+                } else if !self.symbol_table.contains_key(name) {
+                    // Track undefined symbols for selective archive linking
+                    self.undefined_symbols.insert(name.to_string());
                 }
                 continue;
             }
@@ -117,6 +168,9 @@ impl<'a, A: Architecture> Linker<'a, A> {
             if let Some(existing) = self.symbol_table.get(name) {
                 if !is_weak && existing.is_weak { /* overwrite */ } else { continue; }
             }
+
+            // This symbol is now defined - remove from undefined
+            self.undefined_symbols.remove(name);
 
             if let Some(section_index) = sym.section_index() {
                  self.symbol_table.insert(name.to_string(), DefinedSymbol {
@@ -129,7 +183,7 @@ impl<'a, A: Architecture> Linker<'a, A> {
             } else {
                  self.symbol_table.insert(name.to_string(), DefinedSymbol {
                     input_file_index: file_index,
-                    section_index: SectionIndex(0), 
+                    section_index: SectionIndex(0),
                     value: sym.address(),
                     is_weak,
                     is_absolute: true,
@@ -142,30 +196,44 @@ impl<'a, A: Architecture> Linker<'a, A> {
     }
 
     pub fn layout(&mut self) -> Result<()> {
-        self.segments.push(Segment::new(".text", SectionKind::Text));
-        self.segments.push(Segment::new(".rodata", SectionKind::ReadOnlyData));
-        self.segments.push(Segment::new(".data", SectionKind::Data));
-        self.segments.push(Segment::new(".bss", SectionKind::UninitializedData));
-        self.segments.push(Segment::new(".got", SectionKind::Data));
-        self.segments.push(Segment::new(".tdata", SectionKind::Tls)); // Map TLS symbols
+        self.segments.push(Segment::new(".text", SectionKind::Text));       // 0
+        // Special segments for .init and .fini - must concatenate in order
+        self.segments.push(Segment::new(".init", SectionKind::Text));       // 1
+        self.segments.push(Segment::new(".fini", SectionKind::Text));       // 2
+        self.segments.push(Segment::new(".rodata", SectionKind::ReadOnlyData)); // 3
+        self.segments.push(Segment::new(".data", SectionKind::Data));       // 4
+        self.segments.push(Segment::new(".got", SectionKind::Data));        // 5
+        self.segments.push(Segment::new(".tdata", SectionKind::Tls));       // 6
+        // BSS must be last - NOBITS sections don't consume file space
+        // but advance virtual addresses, breaking single-LOAD-segment mapping if not at end
+        self.segments.push(Segment::new(".bss", SectionKind::UninitializedData)); // 7
 
         for (file_index, obj) in self.input_objects.iter().enumerate() {
             for section in obj.sections() {
                 let size = section.size();
                 if size == 0 { continue; }
                 let kind = section.kind();
-                let segment_idx = match kind {
-                    SectionKind::Text => 0,
-                    SectionKind::ReadOnlyData | SectionKind::ReadOnlyString => 1,
-                    SectionKind::Data => 2,
-                    SectionKind::UninitializedData => 3,
-                    SectionKind::Tls => 5, // Keep TLS sections
-                    // Handle init/fini arrays - ELF types 14 (SHT_INIT_ARRAY) and 15 (SHT_FINI_ARRAY)
-                    SectionKind::Elf(14) | SectionKind::Elf(15) => 2, // Put in .data segment
-                    _ => {
-                        tracing::debug!("Skipping section {} (kind: {:?}, size: {})",
-                            section.name().unwrap_or("?"), kind, size);
-                        continue;
+                let section_name = section.name().unwrap_or("");
+
+                // Special handling for .init and .fini sections
+                let segment_idx = if section_name == ".init" {
+                    1
+                } else if section_name == ".fini" {
+                    2
+                } else {
+                    match kind {
+                        SectionKind::Text => 0,
+                        SectionKind::ReadOnlyData | SectionKind::ReadOnlyString => 3,
+                        SectionKind::Data => 4,
+                        SectionKind::UninitializedData => 7,
+                        SectionKind::Tls => 6,
+                        // Handle init/fini arrays - ELF types 14 (SHT_INIT_ARRAY) and 15 (SHT_FINI_ARRAY)
+                        SectionKind::Elf(14) | SectionKind::Elf(15) => 4, // Put in .data segment
+                        _ => {
+                            tracing::debug!("Skipping section {} (kind: {:?}, size: {})",
+                                section_name, kind, size);
+                            continue;
+                        }
                     }
                 };
                 let segment = &mut self.segments[segment_idx];
