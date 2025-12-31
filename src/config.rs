@@ -20,4 +20,8 @@ pub struct Config {
     /// Output file
     #[arg(short, long, default_value = "a.out", help = "Path to the output executable")]
     pub output: PathBuf,
+
+    /// Log level (error, warn, info, debug, trace)
+    #[arg(long, default_value = "info", help = "Set the logging level")]
+    pub log_level: String,
 }

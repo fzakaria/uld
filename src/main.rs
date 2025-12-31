@@ -14,6 +14,8 @@ use memmap2::Mmap;
 use std::fs::File;
 use std::path::PathBuf;
 use object::{Object, Architecture as ObjArch};
+use tracing::{info, warn};
+use tracing_subscriber::EnvFilter;
 
 use uld::arch::x86_64::X86_64;
 use uld::config::Config;
@@ -32,6 +34,14 @@ fn find_library(name: &str, paths: &[PathBuf]) -> Option<PathBuf> {
 
 fn main() -> Result<()> {
     let config = Config::parse();
+
+    let filter = EnvFilter::try_from_default_env()
+        .or_else(|_| EnvFilter::try_new(&config.log_level))
+        .unwrap_or_else(|_| EnvFilter::new("info"));
+
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .init();
     
     let mut final_output = config.output;
     let mut input_paths = Vec::new();
@@ -66,11 +76,11 @@ fn main() -> Result<()> {
             
             if let Some(name) = name {
                 if let Some(path) = find_library(&name, &search_paths) {
-                    println!("Found library -l{}: {}", name, path.display());
+                    info!("Found library -l{}: {}", name, path.display());
                     input_paths.push(path);
                 } else {
-                    println!("Warning: Library -l{} not found in search paths", name);
-                    println!("Search paths: {:?}", search_paths);
+                    warn!("Library -l{} not found in search paths", name);
+                    info!("Search paths: {:?}", search_paths);
                 }
             }
             continue;
@@ -96,7 +106,7 @@ fn main() -> Result<()> {
     // Map input files into memory
     let mut open_files = Vec::new();
     for path in &input_paths {
-        println!("Processing input: {}", path.display());
+        info!("Processing input: {}", path.display());
         let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
         let mmap = unsafe { Mmap::map(&file)? };
         
@@ -134,6 +144,6 @@ fn main() -> Result<()> {
     // 5. Write final executable
     linker.write(&final_output)?;
 
-    println!("Linked successfully to {}", final_output.display());
+    info!("Linked successfully to {}", final_output.display());
     Ok(())
 }

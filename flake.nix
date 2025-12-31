@@ -56,7 +56,11 @@
           in [
             libllvm
             lit
-            clang-with-musl
+            # We don't want the bintools and cc interfering with cargo
+            (runCommand "clang-musl" {} ''
+              mkdir -p $out/bin
+              ln -s ${clang-with-musl}/bin/clang $out/bin/clang-musl
+            '')
           ];
 
           imports = [

@@ -23,5 +23,5 @@ if not os.path.exists(uld_path):
     print(f"Warning: uld binary not found at {uld_path}. Did you run 'cargo build'?")
 
 config.substitutions.append(('%uld', uld_path))
-config.substitutions.append(('%clang', 'clang'))
+config.substitutions.append(('%clang', 'clang-musl'))
 config.substitutions.append(('%filecheck', 'FileCheck'))

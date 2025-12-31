@@ -8,3 +8,5 @@ object = { version = "0.36.0", default-features = false, features = ["read_core"
 memmap2 = "0.9"
 anyhow = "1.0"
 clap = { version = "4.4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

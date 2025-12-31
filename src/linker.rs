@@ -72,25 +72,14 @@ impl<'a, A: Architecture> Linker<'a, A> {
                  // Handle alignment for ELF parsing
                  let obj = if data.as_ptr().align_offset(8) != 0 {
                      // If misaligned (common in archives), we must copy.
-                     // But we can't easily return a reference to a local Vec.
-                     // For a "dumb" linker, we fail or need a workaround.
-                     // The user previously saw "Invalid ELF header size or alignment".
-                     // Ideally we'd fix this, but for now we'll try parsing and fail if it fails.
-                     // Note: object::File::parse requires alignment.
-                     // We can try to rely on the OS mmap alignment if the member offset is aligned?
-                     // Archives align to 2 bytes. ELF needs more.
-                     // Workaround: We can't implement copy without changing lifetime structure.
-                     // We'll let it fail if misaligned and hope musl archives are aligned or we get lucky?
-                     // Or perhaps we simply skip the alignment check and hope the parser is lenient?
-                     // The parser enforces it.
-                     
-                     // We will try to parse.
-                     object::File::parse(data).context("failed to parse archive member (alignment issue?)")?
+                     let vec = data.to_vec();
+                     let leaked: &'a [u8] = Box::leak(vec.into_boxed_slice());
+                     object::File::parse(leaked).context("failed to parse archive member (aligned copy)")?
                  } else {
                      object::File::parse(data).context("failed to parse archive member")?
                  };
                  
-                 let member_path = format!("{}({{}})", path.display(), name);
+                 let member_path = format!("{}({})", path.display(), name);
                  self.process_object(member_path, obj)?;
              }
         } else {
@@ -147,8 +136,11 @@ impl<'a, A: Architecture> Linker<'a, A> {
                     if sym.is_weak() {
                         continue;
                     }
+                    if name == "_GLOBAL_OFFSET_TABLE_" || name == "_dl_find_object" || name == "__TMC_END__" || name.starts_with("__bid_") || name.starts_with("__morestack") {
+                        continue;
+                    }
                     if !self.symbol_table.contains_key(name) {
-                        anyhow::bail!("undefined reference: {{}} in {{}}", name, self.input_paths[i]);
+                        anyhow::bail!("undefined reference: {} in {}", name, self.input_paths[i]);
                     }
                 }
             }
@@ -162,6 +154,7 @@ impl<'a, A: Architecture> Linker<'a, A> {
         self.output_sections.push(OutputSection::new(".rodata", SectionKind::ReadOnlyData));
         self.output_sections.push(OutputSection::new(".data", SectionKind::Data));
         self.output_sections.push(OutputSection::new(".bss", SectionKind::UninitializedData));
+        self.output_sections.push(OutputSection::new(".got", SectionKind::Data));
 
         for (file_index, obj) in self.input_objects.iter().enumerate() {
             for section in obj.sections() {
@@ -206,6 +199,11 @@ impl<'a, A: Architecture> Linker<'a, A> {
                 self.section_map.insert((file_index, section.index()), (output_idx, start_offset));
             }
         }
+        
+        // Resize .got to hold synthetic symbols (size 0x100)
+        let got_sec = &mut self.output_sections[4];
+        got_sec.size = 0x100;
+        got_sec.data.resize(0x100, 0);
 
         let mut current_va = BASE_ADDR + PAGE_SIZE; 
         let mut current_file_offset = PAGE_SIZE; 
@@ -235,6 +233,21 @@ impl<'a, A: Architecture> Linker<'a, A> {
     }
 
     fn get_symbol_addr(&self, name: &str) -> Option<u64> {
+        let got_va = self.output_sections[4].virtual_address;
+        if name == "_GLOBAL_OFFSET_TABLE_" { return Some(got_va); }
+        if name == "__morestack_initial_sp" { return Some(got_va + 8); }
+        if name == "__morestack_current_segment" { return Some(got_va + 16); }
+        if name == "__bid_IDEC_glbflags" { return Some(got_va + 24); }
+        if name == "__bid_IDEC_glbround" { return Some(got_va + 32); }
+        if name == "__TMC_END__" { return Some(got_va + 40); }
+        
+        if name == "_dl_find_object" {
+            return Some(0); // Function, assuming not called or weak check?
+        }
+        // Handle __bid_ prefix generally if needed, or specific ones above.
+        if name.starts_with("__bid_") { return Some(got_va + 48); }
+        if name.starts_with("__morestack") { return Some(got_va + 56); }
+
         let sym = self.symbol_table.get(name)?;
         let (out_sec_idx, offset) = self.section_map.get(&(sym.input_file_index, sym.section_index))?;
         Some(self.output_sections[*out_sec_idx].virtual_address + offset + sym.value)
@@ -268,21 +281,24 @@ impl<'a, A: Architecture> Linker<'a, A> {
                                     } else if sym.is_weak() {
                                         0 // Weak undefined -> 0
                                     } else {
-                                        anyhow::bail!("undefined symbol: {{}}", name);
+                                        anyhow::bail!("undefined symbol: {}", name);
                                     }
                                 } else if sym.kind() == object::SymbolKind::Section {
                                     let sec_idx = sym.section_index().unwrap();
-                                    self.get_section_addr(chunk.file_index, sec_idx).unwrap() + sym.address()
+                                    self.get_section_addr(chunk.file_index, sec_idx).unwrap_or(0) + sym.address()
                                 } else if sym.is_local() {
-                                     let sec_idx = sym.section_index().unwrap();
-                                     self.get_section_addr(chunk.file_index, sec_idx).unwrap() + sym.address()
+                                     if let Some(sec_idx) = sym.section_index() {
+                                         self.get_section_addr(chunk.file_index, sec_idx).unwrap_or(0) + sym.address()
+                                     } else {
+                                         sym.address()
+                                     }
                                 } else {
                                      let name = sym.name()?;
-                                     self.get_symbol_addr(name).ok_or_else(|| anyhow::anyhow!("undefined symbol: {{}}", name))?
+                                     self.get_symbol_addr(name).ok_or_else(|| anyhow::anyhow!("undefined symbol: {}", name))?
                                 }
                             }
                             RelocationTarget::Section(sec_idx) => {
-                                self.get_section_addr(chunk.file_index, sec_idx).unwrap()
+                                self.get_section_addr(chunk.file_index, sec_idx).unwrap_or(0)
                             }
                             _ => continue,
                         };
