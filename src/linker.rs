@@ -10,23 +10,36 @@
 use anyhow::{Context, Result, anyhow};
 use memmap2::Mmap;
 use object::read::{Object, ObjectSection, RelocationTarget, SectionIndex};
-use object::{ObjectSymbol, SectionKind, Endianness, RelocationKind, SymbolKind};
-use object::endian::{U16, U32, U64};
-use object::pod::bytes_of;
+use object::{ObjectSymbol, SectionKind, RelocationKind, SymbolKind};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::os::unix::fs::PermissionsExt;
 
 use crate::arch::Architecture;
 use crate::layout::{Section, Segment};
 use crate::utils::align_up;
+use crate::writer;
 
 const PAGE_SIZE: u64 = 0x1000;
-const BASE_ADDR: u64 = 0x400000; 
 
-fn u16(v: u16) -> U16<Endianness> { U16::new(Endianness::Little, v) }
-fn u32(v: u32) -> U32<Endianness> { U32::new(Endianness::Little, v) }
-fn u64(v: u64) -> U64<Endianness> { U64::new(Endianness::Little, v) }
+// ELF x86_64 relocation types not mapped by object crate
+const R_X86_64_GOTPCRELX: u32 = 41;
+const R_X86_64_REX_GOTPCRELX: u32 = 42;
+
+/// Check if a relocation requires a GOT entry (handles GOTPCRELX variants).
+fn is_got_relocation(reloc: &object::read::Relocation) -> bool {
+    match reloc.kind() {
+        RelocationKind::Got | RelocationKind::GotRelative => return true,
+        _ => {}
+    }
+    // Check raw ELF flags for GOTPCRELX variants
+    if let object::RelocationFlags::Elf { r_type } = reloc.flags() {
+        if r_type == R_X86_64_GOTPCRELX || r_type == R_X86_64_REX_GOTPCRELX {
+            return true;
+        }
+    }
+    false
+}
+const BASE_ADDR: u64 = 0x400000;
 
 /// Representation of a symbol defined in one of the input object files.
 pub struct DefinedSymbol {
@@ -168,7 +181,13 @@ impl<'a, A: Architecture> Linker<'a, A> {
                     SectionKind::Data => 2,
                     SectionKind::UninitializedData => 3,
                     SectionKind::Tls => 5, // Keep TLS sections
-                    _ => continue,
+                    // Handle init/fini arrays - ELF types 14 (SHT_INIT_ARRAY) and 15 (SHT_FINI_ARRAY)
+                    SectionKind::Elf(14) | SectionKind::Elf(15) => 2, // Put in .data segment
+                    _ => {
+                        tracing::debug!("Skipping section {} (kind: {:?}, size: {})",
+                            section.name().unwrap_or("?"), kind, size);
+                        continue;
+                    }
                 };
                 let segment = &mut self.segments[segment_idx];
                 let start_offset = align_up(segment.size, section.align().max(1));
@@ -186,15 +205,14 @@ impl<'a, A: Architecture> Linker<'a, A> {
         for obj in &self.input_objects {
             for section in obj.sections() {
                 for (_, reloc) in section.relocations() {
-                    let mut needs_got = false;
-                    match reloc.kind() {
-                        RelocationKind::Got | RelocationKind::GotRelative => needs_got = true,
-                        _ => {
-                            if let RelocationTarget::Symbol(idx) = reloc.target() {
-                                if let Ok(sym) = obj.symbol_by_index(idx) {
-                                    if sym.kind() == SymbolKind::Tls {
-                                        needs_got = true;
-                                    }
+                    let mut needs_got = is_got_relocation(&reloc);
+
+                    // Also check for TLS symbols
+                    if !needs_got {
+                        if let RelocationTarget::Symbol(idx) = reloc.target() {
+                            if let Ok(sym) = obj.symbol_by_index(idx) {
+                                if sym.kind() == SymbolKind::Tls {
+                                    needs_got = true;
                                 }
                             }
                         }
@@ -311,10 +329,9 @@ impl<'a, A: Architecture> Linker<'a, A> {
                             RelocationTarget::Symbol(idx) => {
                                 let sym = obj.symbol_by_index(idx)?;
                                 let name = sym.name()?;
-                                let kind = reloc.kind();
-                                
-                                // Check for GOT usage (Standard GOT or TLS targeting)
-                                let use_got = kind == RelocationKind::Got || kind == RelocationKind::GotRelative || sym.kind() == SymbolKind::Tls;
+
+                                // Check for GOT usage (handles GOTPCRELX variants) or TLS
+                                let use_got = is_got_relocation(&reloc) || sym.kind() == SymbolKind::Tls;
 
                                 if use_got {
                                     let g_offset = self.got_map.get(name).cloned().context("GOT entry missing")?;
@@ -369,154 +386,9 @@ impl<'a, A: Architecture> Linker<'a, A> {
         let (seg_idx, offset) = self.section_map.get(&(file_index, section_index))?;
         Some(self.segments[*seg_idx].virtual_address + offset)
     }
-    
+
     pub fn write(&self, output_path: &PathBuf) -> Result<()> {
-        let mut buffer = Vec::new();
-        let num_sections = self.segments.len() as u32 + 2; 
-
-        let file_header = object::elf::FileHeader64::<Endianness> {
-            e_ident: object::elf::Ident {
-                magic: object::elf::ELFMAG,
-                class: object::elf::ELFCLASS64,
-                data: object::elf::ELFDATA2LSB,
-                version: object::elf::EV_CURRENT,
-                os_abi: object::elf::ELFOSABI_SYSV,
-                abi_version: 0,
-                padding: [0; 7],
-            },
-            e_type: u16(object::elf::ET_EXEC),
-            e_machine: u16(object::elf::EM_X86_64),
-            e_version: u32(object::elf::EV_CURRENT as u32),
-            e_entry: u64(self.get_symbol_addr("_start").unwrap_or(0)),
-            e_phoff: u64(64),
-            e_shoff: u64(0), 
-            e_flags: u32(0),
-            e_ehsize: u16(64),
-            e_phentsize: u16(56),
-            e_phnum: u16(1),
-            e_shentsize: u16(64),
-            e_shnum: u16(num_sections as u16), 
-            e_shstrndx: u16(num_sections as u16 - 1),
-        };
-        buffer.extend_from_slice(bytes_of(&file_header));
-
-        let last_segment = self.segments.iter() 
-            .filter(|s| s.kind != SectionKind::UninitializedData && s.size > 0)
-            .last();
-
-        let file_size = if let Some(seg) = last_segment {
-                seg.file_offset + seg.size
-        } else {
-                PAGE_SIZE
-        };
-        
-        let mem_size = self.segments.iter()
-            .map(|s| if s.virtual_address > 0 { s.virtual_address + s.size } else { BASE_ADDR })
-            .max().unwrap_or(BASE_ADDR) - BASE_ADDR;
-
-        let prog_header = object::elf::ProgramHeader64::<Endianness> {
-            p_type: u32(object::elf::PT_LOAD),
-            p_flags: u32(object::elf::PF_R | object::elf::PF_W | object::elf::PF_X),
-            p_offset: u64(0),
-            p_vaddr: u64(BASE_ADDR),
-            p_paddr: u64(BASE_ADDR),
-            p_filesz: u64(file_size),
-            p_memsz: u64(mem_size),
-            p_align: u64(PAGE_SIZE),
-        };
-        buffer.extend_from_slice(bytes_of(&prog_header));
-
-        if (buffer.len() as u64) < PAGE_SIZE {
-            buffer.resize(PAGE_SIZE as usize, 0);
-        }
-
-        for segment in &self.segments {
-            if segment.kind == SectionKind::UninitializedData { continue; }
-            let current = buffer.len() as u64; 
-            if segment.file_offset > current {
-                buffer.resize(segment.file_offset as usize, 0);
-            }
-            buffer.extend_from_slice(&segment.data);
-        }
-        
-        let mut shstrtab = Vec::new();
-        shstrtab.push(0); 
-        let mut section_name_offsets = Vec::new();
-        section_name_offsets.push(0);
-        
-        for segment in &self.segments {
-            let off = shstrtab.len();
-            section_name_offsets.push(off);
-            shstrtab.extend_from_slice(segment.name.as_bytes());
-            shstrtab.push(0);
-        }
-        
-        let shstrtab_offset = shstrtab.len();
-        section_name_offsets.push(shstrtab_offset);
-        shstrtab.extend_from_slice(b".shstrtab\0");
-        
-        let shoff = buffer.len(); 
-        
-        let null_sec = object::elf::SectionHeader64::<Endianness> {
-            sh_name: u32(0),
-            sh_type: u32(object::elf::SHT_NULL),
-            sh_flags: u64(0),
-            sh_addr: u64(0),
-            sh_offset: u64(0),
-            sh_size: u64(0),
-            sh_link: u32(0),
-            sh_info: u32(0),
-            sh_addralign: u64(0),
-            sh_entsize: u64(0),
-        };
-        buffer.extend_from_slice(bytes_of(&null_sec));
-        
-        for (i, segment) in self.segments.iter().enumerate() {
-            let sec_header = object::elf::SectionHeader64::<Endianness> {
-                sh_name: u32(section_name_offsets[i+1] as u32),
-                sh_type: u32(if segment.kind == SectionKind::UninitializedData { object::elf::SHT_NOBITS } else { object::elf::SHT_PROGBITS }),
-                sh_flags: u64(match segment.kind {
-                    SectionKind::Text => object::elf::SHF_ALLOC | object::elf::SHF_EXECINSTR,
-                    SectionKind::Data => object::elf::SHF_ALLOC | object::elf::SHF_WRITE,
-                    SectionKind::UninitializedData => object::elf::SHF_ALLOC | object::elf::SHF_WRITE,
-                    _ => object::elf::SHF_ALLOC,
-                } as u64),
-                sh_addr: u64(segment.virtual_address),
-                sh_offset: u64(segment.file_offset),
-                sh_size: u64(segment.size),
-                sh_link: u32(0),
-                sh_info: u32(0),
-                sh_addralign: u64(16),
-                sh_entsize: u64(0),
-            };
-            buffer.extend_from_slice(bytes_of(&sec_header));
-        }
-        
-        let shstrtab_header = object::elf::SectionHeader64::<Endianness> {
-            sh_name: u32(section_name_offsets[section_name_offsets.len()-1] as u32),
-            sh_type: u32(object::elf::SHT_STRTAB),
-            sh_flags: u64(0),
-            sh_addr: u64(0),
-            sh_offset: u64((shoff + (num_sections as usize * 64)) as u64), 
-            sh_size: u64(shstrtab.len() as u64),
-            sh_link: u32(0),
-            sh_info: u32(0),
-            sh_addralign: u64(1),
-            sh_entsize: u64(0),
-        };
-        buffer.extend_from_slice(bytes_of(&shstrtab_header));
-        
-        buffer.extend_from_slice(&shstrtab);
-        
-        let shoff_bytes = (shoff as u64).to_le_bytes();
-        buffer[40..48].copy_from_slice(&shoff_bytes);
-        
-        std::fs::write(output_path, &buffer)?;
-        
-        let mut perms = std::fs::metadata(output_path)?.permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(output_path, perms)?;
-
-        Ok(())
+        let entry_point = self.get_symbol_addr("_start").unwrap_or(0);
+        writer::write_elf(output_path, &self.segments, entry_point)
     }
 }

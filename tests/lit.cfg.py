@@ -4,7 +4,7 @@ import os
 config.name = 'uld'
 config.test_format = lit.formats.ShTest(True)
 
-config.suffixes = ['.c']
+config.suffixes = ['.c', '.s']
 
 # Source directory
 config.test_source_root = os.path.dirname(__file__)
@@ -24,4 +24,5 @@ if not os.path.exists(uld_path):
 
 config.substitutions.append(('%uld', uld_path))
 config.substitutions.append(('%clang', 'musl-clang'))
+config.substitutions.append(('%as', 'as'))
 config.substitutions.append(('%filecheck', 'filecheck'))

@@ -7,6 +7,7 @@
 //! - `linker`: The main linking orchestration.
 //! - `layout`: Output memory layout management.
 //! - `symbol`: Symbol table management.
+//! - `writer`: ELF file writing.
 
 pub mod arch;
 pub mod config;
@@ -14,3 +15,4 @@ pub mod linker;
 pub mod layout;
 pub mod symbol;
 pub mod utils;
+pub mod writer;

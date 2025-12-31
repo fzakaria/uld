@@ -5,7 +5,11 @@
 use super::Architecture;
 use anyhow::{anyhow, Result};
 use object::read::Relocation;
-use object::{Endianness, RelocationKind};
+use object::{Endianness, RelocationFlags, RelocationKind};
+
+// ELF x86_64 relocation types not mapped by object crate
+const R_X86_64_GOTPCRELX: u32 = 41;
+const R_X86_64_REX_GOTPCRELX: u32 = 42;
 
 /// The x86_64 architecture backend.
 pub struct X86_64;
@@ -39,32 +43,36 @@ impl Architecture for X86_64 {
              }
         }
 
+        // Check for GOTPCRELX variants using raw ELF flags
+        let is_gotpcrelx = matches!(
+            reloc.flags(),
+            RelocationFlags::Elf { r_type } if r_type == R_X86_64_GOTPCRELX || r_type == R_X86_64_REX_GOTPCRELX
+        );
+
         let val: u64 = match reloc.kind() {
             // R_X86_64_64: S + A
             RelocationKind::Absolute => (s as i64 + final_addend) as u64,
 
             // R_X86_64_PC32 / PLT32 / GOTPCREL: S + A - P
-            // P is the VA of the relocation (the 4 bytes of displacement).
-            //
-            // In x86_64, RIP-relative addressing is relative to the address of the 
-            // *next* instruction. For a standard 4-byte displacement, the next 
-            // instruction starts at P + 4.
-            // The hardware formula is: Target = RIP_next + displacement
-            // So: displacement = Target - RIP_next = Target - (P + 4) = Target - 4 - P.
-            //
-            // The compiler usually provides an addend (A) of -4 to account for this.
-            // Calculation: S + A - P
             RelocationKind::Relative | RelocationKind::PltRelative | RelocationKind::GotRelative => {
                 (s as i64 + final_addend - p as i64) as u64
             }
             _ => {
-                tracing::trace!("Unsupported relocation kind: {:?}", reloc.kind());
-                return Ok(());
+                // Handle GOTPCRELX variants (same calculation as GOTPCREL)
+                if is_gotpcrelx {
+                    (s as i64 + final_addend - p as i64) as u64
+                } else {
+                    tracing::trace!("Unsupported relocation kind: {:?}", reloc.kind());
+                    return Ok(());
+                }
             }
         };
 
+        // Determine relocation size - GOTPCRELX returns 0 from object crate, but is 32-bit
+        let size = if reloc.size() == 0 && is_gotpcrelx { 32 } else { reloc.size() };
+
         // Write the value to the buffer.
-        match reloc.size() {
+        match size {
             32 => {
                 // x86_64 PC-relative displacements are signed 32-bit integers.
                 // We check if the calculated value fits in the signed 32-bit range.
