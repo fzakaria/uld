@@ -1,146 +1,65 @@
 //! Entry point for the uld linker.
 //!
-//! This file handles high-level application flow:
-//! 1. Parse command-line arguments using `clap`.
-//! 2. Initialize the linker with the `X86_64` backend (the only supported architecture).
-//! 3. Verify input files match the target architecture.
-//! 4. Execute the linking steps: load, resolve, layout, relocate, write.
-//!
-//! Error handling is done via `anyhow`.
+//! Simple flow: parse args → load files → link → write executable.
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use memmap2::Mmap;
+use object::{Architecture as ObjArch, Object};
 use std::fs::File;
-use std::path::PathBuf;
-use object::{Object, Architecture as ObjArch};
-use tracing::{info, warn};
+use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use uld::arch::x86_64::X86_64;
 use uld::config::Config;
 use uld::linker::Linker;
 
-fn find_library(name: &str, paths: &[PathBuf]) -> Option<PathBuf> {
-    let filename = format!("lib{}.a", name);
-    for path in paths {
-        let full_path = path.join(&filename);
-        if full_path.exists() {
-            return Some(full_path);
-        }
-    }
-    None
-}
-
 fn main() -> Result<()> {
     let config = Config::parse();
 
+    // Initialize logging
     let filter = EnvFilter::try_from_default_env()
         .or_else(|_| EnvFilter::try_new(&config.log_level))
         .unwrap_or_else(|_| EnvFilter::new("info"));
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .init();
-    
-    let mut final_output = config.output;
-    let mut input_paths = Vec::new();
-    let mut search_paths = Vec::new();
-
-    let mut iter = config.inputs.into_iter();
-    while let Some(arg) = iter.next() {
-        if arg == "-o" {
-            if let Some(path) = iter.next() {
-                final_output = PathBuf::from(path);
-            }
-            continue;
-        }
-        
-        if arg.starts_with("-L") {
-            if arg == "-L" {
-                if let Some(path) = iter.next() {
-                    search_paths.push(PathBuf::from(path));
-                }
-            } else {
-                search_paths.push(PathBuf::from(&arg[2..]));
-            }
-            continue;
-        }
-
-        if arg.starts_with("-l") {
-            let name = if arg == "-l" {
-                iter.next()
-            } else {
-                Some(arg[2..].to_string())
-            };
-            
-            if let Some(name) = name {
-                if let Some(path) = find_library(&name, &search_paths) {
-                    info!("Found library -l{}: {}", name, path.display());
-                    input_paths.push(path);
-                } else {
-                    warn!("Library -l{} not found in search paths", name);
-                    info!("Search paths: {:?}", search_paths);
-                }
-            }
-            continue;
-        }
-        
-        if arg.starts_with("-") {
-            continue; // Ignore other flags
-        }
-        
-        let path = PathBuf::from(&arg);
-        if !path.exists() {
-             // Ignore non-existent files (assumed flag args)
-             continue; 
-        }
-        
-        input_paths.push(path);
-    }
-
+    // Resolve inputs (handles -l, -L, -o)
+    let (output_path, input_paths) = config.resolve_inputs();
     if input_paths.is_empty() {
         anyhow::bail!("no input files");
     }
 
-    // Map input files into memory
+    // Memory-map input files and verify architecture
     let mut open_files = Vec::new();
     for path in &input_paths {
         info!("Processing input: {}", path.display());
         let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
         let mmap = unsafe { Mmap::map(&file)? };
-        
-        // Architecture Check
-        // We only check objects, skip archives for now (archives can contain objects of different arch, theoretically)
-        // But checking archive magic is better.
-        let magic = &mmap[..8.min(mmap.len())];
-        if !magic.starts_with(b"!<arch>\n") {
-             let obj = object::File::parse(&*mmap).context("failed to parse object file")?;
-             if obj.architecture() != ObjArch::X86_64 {
-                 anyhow::bail!("Unsupported architecture in {}: {:?}. Only X86_64 is supported.", path.display(), obj.architecture());
-             }
+
+        // Verify x86_64 architecture (skip archives)
+        if !mmap.starts_with(b"!<arch>\n") {
+            let obj = object::File::parse(&*mmap).context("failed to parse object file")?;
+            if obj.architecture() != ObjArch::X86_64 {
+                anyhow::bail!(
+                    "Unsupported architecture in {}: {:?}. Only X86_64 is supported.",
+                    path.display(),
+                    obj.architecture()
+                );
+            }
         }
 
         open_files.push((path.clone(), mmap));
     }
 
-    // Initialize Linker with x86_64 backend
+    // Link
     let mut linker = Linker::new(X86_64);
-
-    // 1. Add files (Parses symbols)
     for (path, mmap) in &open_files {
         linker.add_file(path.clone(), mmap)?;
     }
-
-    // 2. Layout sections in memory
     linker.layout()?;
-
-    // 3. Apply relocations
     linker.relocate()?;
+    linker.write(&output_path)?;
 
-    // 4. Write final executable
-    linker.write(&final_output)?;
-
-    info!("Linked successfully to {}", final_output.display());
+    info!("Linked successfully to {}", output_path.display());
     Ok(())
 }

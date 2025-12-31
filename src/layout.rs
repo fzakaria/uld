@@ -10,6 +10,7 @@ use object::SectionKind;
 ///
 /// A `Section` corresponds to a section from an object file that will be copied
 /// into a specific `Segment`.
+#[derive(Clone)]
 pub struct Section {
     /// Index of the input file.
     pub file_index: usize,
