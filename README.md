@@ -1,4 +1,4 @@
-# uld - A Minimal Rust Static Linker
+# µld - A Minimal Rust Static Linker
 
 `uld` is a minimal static linker written in Rust for educational purposes. It targets **x86_64 Linux ELF** binaries.
 
