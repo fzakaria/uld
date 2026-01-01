@@ -369,13 +369,7 @@ impl<'a, A: Architecture> Linker<'a, A> {
         self.symbols
             .get(name)
             .and_then(|s| s.resolved_address)
-            .unwrap_or_else(|| {
-                if self.weak.contains(name) || is_optional_symbol(name) {
-                    0
-                } else {
-                    0
-                }
-            })
+            .unwrap_or(0)
     }
 
     fn sec_addr(&self, fi: usize, si: SectionIndex) -> u64 {
