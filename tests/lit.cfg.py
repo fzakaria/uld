@@ -26,15 +26,21 @@ if not os.path.exists(uld_path):
 support_dir = os.path.join(os.path.dirname(__file__), 'support')
 
 config.substitutions.append(('%uld', uld_path))
-config.substitutions.append(('%clang', 'musl-clang'))
-config.substitutions.append(('%cc', 'clang'))
+config.substitutions.append(('%cc', 'musl-gcc'))
 config.substitutions.append(('%as', 'as'))
 config.substitutions.append(('%start', os.path.join(support_dir, 'start.s')))
 config.substitutions.append(('%helper', os.path.join(support_dir, 'c_helper.c')))
 config.substitutions.append(('%filecheck', 'filecheck'))
 
 # musl libc CRT files for static linking
-config.substitutions.append(('%crt1', '/usr/x86_64-linux-musl/lib64/crt1.o'))
-config.substitutions.append(('%crti', '/usr/x86_64-linux-musl/lib64/crti.o'))
-config.substitutions.append(('%crtn', '/usr/x86_64-linux-musl/lib64/crtn.o'))
-config.substitutions.append(('%libc', '/usr/x86_64-linux-musl/lib64/libc.a'))
+# Try common paths: Fedora uses lib64, Ubuntu uses lib
+musl_lib_paths = [
+    '/usr/x86_64-linux-musl/lib64',  # Fedora
+    '/usr/lib/x86_64-linux-musl',     # Ubuntu
+]
+musl_lib = next((p for p in musl_lib_paths if os.path.exists(p)), musl_lib_paths[0])
+
+config.substitutions.append(('%crt1', os.path.join(musl_lib, 'crt1.o')))
+config.substitutions.append(('%crti', os.path.join(musl_lib, 'crti.o')))
+config.substitutions.append(('%crtn', os.path.join(musl_lib, 'crtn.o')))
+config.substitutions.append(('%libc', os.path.join(musl_lib, 'libc.a')))

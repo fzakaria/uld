@@ -1,5 +1,5 @@
-// RUN: %clang -c %s -o %t.o
-// RUN: %clang -fuse-ld=%uld -static -o %t.exe %t.o
+// RUN: %cc -c %s -o %t.o
+// RUN: %cc -fuse-ld=%uld -static -o %t.exe %t.o
 // RUN: (%t.exe; echo "Exit: $?") | %filecheck %s
 
 // CHECK: fib(10) = 55

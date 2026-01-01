@@ -68,35 +68,11 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-dev musl-tools clang llvm
+          sudo apt-get install -y musl-dev musl-tools
 
       - name: Install Python tools
         run: |
           pip install lit filecheck
-
-      - name: Create musl-clang wrapper
-        run: |
-          cat > /usr/local/bin/musl-clang << 'EOF'
-          #!/bin/sh
-          exec clang \
-            --target=x86_64-linux-musl \
-            -nostdinc \
-            -isystem /usr/include/x86_64-linux-musl \
-            -isystem /usr/include \
-            "$@"
-          EOF
-          chmod +x /usr/local/bin/musl-clang
-        shell: sudo bash {0}
-
-      - name: Setup musl lib directory
-        run: |
-          # Create expected directory structure
-          sudo mkdir -p /usr/x86_64-linux-musl/lib64
-          # Link musl libc files to expected location
-          sudo ln -sf /usr/lib/x86_64-linux-musl/crt1.o /usr/x86_64-linux-musl/lib64/
-          sudo ln -sf /usr/lib/x86_64-linux-musl/crti.o /usr/x86_64-linux-musl/lib64/
-          sudo ln -sf /usr/lib/x86_64-linux-musl/crtn.o /usr/x86_64-linux-musl/lib64/
-          sudo ln -sf /usr/lib/x86_64-linux-musl/libc.a /usr/x86_64-linux-musl/lib64/
 
       - name: Build uld
         run: cargo build

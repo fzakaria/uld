@@ -1,4 +1,4 @@
-// RUN: %clang -c %s -o %t.o
+// RUN: %cc -c %s -o %t.o
 // RUN: %uld -o %t.exe %crt1 %crti %t.o %libc %crtn
 // RUN: (%t.exe; echo "Exit: $?") | %filecheck %s
 
