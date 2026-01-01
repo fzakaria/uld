@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel in-progress runs on new commits to the same branch
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  fmt:
+    name: Formatting
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --all-targets
+
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test
+
+  lit-tests:
+    name: Integration Tests (lit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-dev musl-tools clang llvm
+
+      - name: Install Python tools
+        run: |
+          pip install lit filecheck
+
+      - name: Create musl-clang wrapper
+        run: |
+          cat > /usr/local/bin/musl-clang << 'EOF'
+          #!/bin/sh
+          exec clang \
+            --target=x86_64-linux-musl \
+            -nostdinc \
+            -isystem /usr/include/x86_64-linux-musl \
+            -isystem /usr/include \
+            "$@"
+          EOF
+          chmod +x /usr/local/bin/musl-clang
+        shell: sudo bash {0}
+
+      - name: Setup musl lib directory
+        run: |
+          # Create expected directory structure
+          sudo mkdir -p /usr/x86_64-linux-musl/lib64
+          # Link musl libc files to expected location
+          sudo ln -sf /usr/lib/x86_64-linux-musl/crt1.o /usr/x86_64-linux-musl/lib64/
+          sudo ln -sf /usr/lib/x86_64-linux-musl/crti.o /usr/x86_64-linux-musl/lib64/
+          sudo ln -sf /usr/lib/x86_64-linux-musl/crtn.o /usr/x86_64-linux-musl/lib64/
+          sudo ln -sf /usr/lib/x86_64-linux-musl/libc.a /usr/x86_64-linux-musl/lib64/
+
+      - name: Build uld
+        run: cargo build
+
+      - name: Run lit tests
+        run: lit tests/ -v
