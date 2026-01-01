@@ -30,14 +30,13 @@ impl Architecture for X86_64 {
         // if the addend is 0 and try to read from the buffer to support implicit addends
         // which can sometimes appear in specific toolchains or object formats.
         let mut final_addend = a;
-        if final_addend == 0 && reloc.size() == 32 {
-            if offset + 4 <= data.len() {
+        if final_addend == 0 && reloc.size() == 32
+            && offset + 4 <= data.len() {
                 let existing = i32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
                 if existing != 0 {
                     final_addend = existing as i64;
                 }
             }
-        }
 
         let val: u64 = match reloc.kind() {
             // R_X86_64_64: S + A

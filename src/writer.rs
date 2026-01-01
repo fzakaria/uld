@@ -60,7 +60,7 @@ pub fn write_elf(output_path: &PathBuf, segments: &[Segment], entry_point: u64) 
     let last_segment = segments
         .iter()
         .filter(|s| s.kind != SectionKind::UninitializedData && s.size > 0)
-        .last();
+        .next_back();
 
     let file_size = if let Some(seg) = last_segment {
         seg.file_offset + seg.size
