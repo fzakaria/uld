@@ -48,6 +48,7 @@ impl<'a, A: Architecture> Linker<'a, A> {
     }
 
     pub fn add_file(&mut self, path: &PathBuf, mmap: &'a Mmap) -> Result<()> {
+        // https://alpha-supernova.dev.filibeto.org/lib/rel/5.1B/DOCS/HTML/SUPPDOCS/OBJSPEC/NV160XXX.HTM
         if mmap.starts_with(b"!<arch>\n") {
             return self.add_archive(path, mmap);
         }
@@ -55,28 +56,43 @@ impl<'a, A: Architecture> Linker<'a, A> {
     }
 
     fn add_archive(&mut self, path: &PathBuf, mmap: &'a Mmap) -> Result<()> {
-        let archive = object::read::archive::ArchiveFile::parse(&**mmap)?;
+        let archive = object::read::archive::ArchiveFile::parse(mmap.as_ref())?;
 
-        // Index symbols → member data
+        // Loop over all the object files within the archive
+        // Create an index of symbol name -> archive member data
         let mut index: HashMap<String, &'a [u8]> = HashMap::new();
         for member in archive.members() {
             let member = member?;
-            let mut data = member.data(&**mmap)?;
+            let mut data = member.data(mmap.as_ref())?;
             // Align for parsing
             if data.as_ptr().align_offset(8) != 0 {
+                // Force the data onto the heap to get it aligned
+                // FIXME: Can we avoid this leak?
                 data = Box::leak(data.to_vec().into_boxed_slice());
             }
             let Ok(obj) = object::File::parse(data) else {
+                tracing::info!(
+                    "Failed to parse archive member {:?} within {:?}",
+                    member,
+                    path
+                );
                 continue;
             };
+            // Kind of an edge case but maybe this archive contains different
+            // architectures
+            if obj.architecture() != A::arch() {
+                continue;
+            }
             for sym in obj.symbols() {
-                let Ok(name) = sym.name() else { continue };
+                let name = sym.name()?;
                 if !sym.is_undefined() && !sym.is_local() {
                     index.insert(name.to_string(), data);
                 }
             }
         }
 
+        // FIXME: If we happen to parse archives before any object files the
+        // needed list will be empty.
         // Pull in members defining needed symbols (iterate until fixpoint)
         let mut included = HashSet::new();
         loop {
@@ -96,7 +112,6 @@ impl<'a, A: Architecture> Linker<'a, A> {
                 }
             }
         }
-        let _ = path; // silence warning
         Ok(())
     }
 
@@ -126,6 +141,8 @@ impl<'a, A: Architecture> Linker<'a, A> {
             if sym.is_local() {
                 continue;
             }
+
+            // If the symbol is weak, we actually let the next one overwrite it.
             if self.symbols.contains_key(name) && !self.symbols[name].is_weak {
                 continue;
             }
@@ -283,11 +300,11 @@ impl<'a, A: Architecture> Linker<'a, A> {
         let entries: Vec<_> = self
             .got
             .iter()
-            .map(|(n, &o)| (o, self.sym_addr(n)))
+            .map(|(name, &offset)| (offset, self.sym_addr(name)))
             .collect();
         if let Some(g) = self.segments.iter_mut().find(|s| s.name == ".got") {
-            for (o, a) in entries {
-                g.data[o as usize..][..8].copy_from_slice(&a.to_le_bytes());
+            for (offset, addr) in entries {
+                g.data[offset as usize..][..8].copy_from_slice(&addr.to_le_bytes());
             }
         }
 
@@ -306,7 +323,7 @@ impl<'a, A: Architecture> Linker<'a, A> {
                         s.relocations()
                             .filter_map(|(o, r)| {
                                 let t =
-                                    self.reloc_target(obj, &r, sec.file_index, got_va).ok()??;
+                                    self.reloc_target(obj, &r, sec.file_index, got_va).ok()?;
                                 Some((sec.offset + o, r, base + o, t))
                             })
                             .collect::<Vec<_>>(),
@@ -323,26 +340,24 @@ impl<'a, A: Architecture> Linker<'a, A> {
         Ok(())
     }
 
-    fn reloc_target(
-        &self,
-        obj: &object::File,
-        r: &Relocation,
-        fi: usize,
-        got: u64,
-    ) -> Result<Option<u64>> {
+    /// Find the address of a relocation target
+    /// Afterwards the arch specific implementation can apply the relocation
+    fn reloc_target(&self, obj: &object::File, r: &Relocation, fi: usize, got: u64) -> Result<u64> {
         Ok(match r.target() {
             RelocationTarget::Symbol(i) => {
                 let s = obj.symbol_by_index(i)?;
                 let use_got = matches!(r.kind(), RelocationKind::Got | RelocationKind::GotRelative)
                     || s.kind() == SymbolKind::Tls;
-                Some(if use_got {
-                    got + self.got.get(s.name()?).context("GOT?")?
+                if use_got {
+                    let name = s.name()?;
+                    got + self.got.get(name).context(format!("Missing GOT entry for: {}", name))?
                 } else {
                     self.resolve_sym(fi, &s)?
-                })
+                }
             }
-            RelocationTarget::Section(i) => Some(self.sec_addr(fi, i)),
-            _ => None,
+            RelocationTarget::Section(i) => self.sec_addr(fi, i),
+            RelocationTarget::Absolute => 0,
+            _ => unreachable!("This target never existed before: {:?}", r.target()),
         })
     }
 
