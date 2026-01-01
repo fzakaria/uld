@@ -3,7 +3,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use memmap2::Mmap;
-use object::{Architecture as ObjArch, Object};
 use std::fs::File;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -33,20 +32,14 @@ fn main() -> Result<()> {
             info!("Loading: {}", p.display());
             let f = File::open(p).with_context(|| format!("open {}", p.display()))?;
             let m = unsafe { Mmap::map(&f)? };
-            if !m.starts_with(b"!<arch>\n") {
-                let obj = object::File::parse(&*m)?;
-                if obj.architecture() != ObjArch::X86_64 {
-                    anyhow::bail!("unsupported: {:?}", obj.architecture());
-                }
-            }
-            Ok((p.clone(), m))
+            Ok((p, m))
         })
         .collect::<Result<Vec<_>>>()?;
 
     // Link
     let mut linker = Linker::new(X86_64);
     for (p, m) in &mmaps {
-        linker.add_file(p.clone(), m)?;
+        linker.add_file(p, m)?;
     }
     linker.link()?;
     linker.write(&config.output())?;

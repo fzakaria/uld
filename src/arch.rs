@@ -12,6 +12,9 @@ pub mod x86_64;
 
 /// A trait representing a target architecture (e.g., x86_64, AArch64).
 pub trait Architecture {
+    /// The object file format architecture
+    fn arch() -> object::Architecture;
+
     /// The object crate's endianness for this architecture.
     fn endianness(&self) -> Endianness;
 

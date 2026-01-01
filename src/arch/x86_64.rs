@@ -11,6 +11,10 @@ use object::{Endianness, RelocationKind};
 pub struct X86_64;
 
 impl Architecture for X86_64 {
+    fn arch() -> object::Architecture {
+        object::Architecture::X86_64
+    }
+
     fn endianness(&self) -> Endianness {
         Endianness::Little
     }

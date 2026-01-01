@@ -47,9 +47,9 @@ impl<'a, A: Architecture> Linker<'a, A> {
         }
     }
 
-    pub fn add_file(&mut self, path: PathBuf, mmap: &'a Mmap) -> Result<()> {
+    pub fn add_file(&mut self, path: &PathBuf, mmap: &'a Mmap) -> Result<()> {
         if mmap.starts_with(b"!<arch>\n") {
-            return self.add_archive(&path, mmap);
+            return self.add_archive(path, mmap);
         }
         self.add_object(object::File::parse(&**mmap)?)
     }
@@ -101,6 +101,10 @@ impl<'a, A: Architecture> Linker<'a, A> {
     }
 
     fn add_object(&mut self, obj: object::File<'a>) -> Result<()> {
+        if A::arch() != obj.architecture() {
+            return Err(anyhow!("unsupported: {:?}", obj.architecture()));
+        }
+
         let idx = self.objects.len();
 
         for sym in obj.symbols() {
