@@ -32,10 +32,10 @@ cargo build
 ./target/debug/uld -o output crt1.o crti.o main.o -L/path -lc crtn.o
 ```
 
-### Via clang driver (recommended)
+### Via gcc driver (recommended)
 ```bash
-# Compile and link a static binary using musl-clang
-musl-clang -fuse-ld=/path/to/uld -static -o hello hello.c
+# Compile and link a static binary using musl-gcc
+musl-gcc -fuse-ld=/path/to/uld -static -o hello hello.c
 ```
 
 ## Project Structure
@@ -90,7 +90,7 @@ lit tests/ -v
 ## Requirements
 
 - Rust (stable)
-- musl-clang (for libc tests)
+- musl-gcc (for libc tests)
 - LLVM lit and FileCheck (for running tests)
 
 ## Limitations
