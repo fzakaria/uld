@@ -58,9 +58,7 @@ pub fn write_elf(output_path: &PathBuf, segments: &[Segment], entry_point: u64) 
 
     // Calculate file and memory sizes for the LOAD segment
     let last_segment = segments
-        .iter()
-        .filter(|s| s.kind != SectionKind::UninitializedData && s.size > 0)
-        .next_back();
+        .iter().rfind(|s| s.kind != SectionKind::UninitializedData && s.size > 0);
 
     let file_size = if let Some(seg) = last_segment {
         seg.file_offset + seg.size
