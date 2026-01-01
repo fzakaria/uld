@@ -19,7 +19,7 @@ fn main() -> Result<()> {
         .with_env_filter(EnvFilter::try_new(&config.log_level).unwrap_or_else(|_| EnvFilter::new("warn")))
         .init();
 
-    let (output, files) = config.parse_args();
+    let files = config.input_files();
     if files.is_empty() {
         anyhow::bail!("no input files");
     }
@@ -29,7 +29,6 @@ fn main() -> Result<()> {
         info!("Loading: {}", p.display());
         let f = File::open(p).with_context(|| format!("open {}", p.display()))?;
         let m = unsafe { Mmap::map(&f)? };
-        // Check architecture (skip archives)
         if !m.starts_with(b"!<arch>\n") {
             let obj = object::File::parse(&*m)?;
             if obj.architecture() != ObjArch::X86_64 {
@@ -45,8 +44,8 @@ fn main() -> Result<()> {
         linker.add_file(p.clone(), m)?;
     }
     linker.link()?;
-    linker.write(&output)?;
+    linker.write(&config.output())?;
 
-    info!("Wrote: {}", output.display());
+    info!("Wrote: {}", config.output().display());
     Ok(())
 }
