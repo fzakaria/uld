@@ -322,8 +322,7 @@ impl<'a, A: Architecture> Linker<'a, A> {
                     Some(
                         s.relocations()
                             .filter_map(|(o, r)| {
-                                let t =
-                                    self.reloc_target(obj, &r, sec.file_index, got_va).ok()?;
+                                let t = self.reloc_target(obj, &r, sec.file_index, got_va).ok()?;
                                 Some((sec.offset + o, r, base + o, t))
                             })
                             .collect::<Vec<_>>(),
@@ -350,7 +349,10 @@ impl<'a, A: Architecture> Linker<'a, A> {
                     || s.kind() == SymbolKind::Tls;
                 if use_got {
                     let name = s.name()?;
-                    got + self.got.get(name).context(format!("Missing GOT entry for: {}", name))?
+                    got + self
+                        .got
+                        .get(name)
+                        .context(format!("Missing GOT entry for: {}", name))?
                 } else {
                     self.resolve_sym(fi, &s)?
                 }
