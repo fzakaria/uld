@@ -6,7 +6,7 @@
 //! 4. Apply relocations
 //! 5. Write ELF
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use memmap2::Mmap;
 use object::read::{Object, ObjectSection, RelocationTarget, SectionIndex};
 use object::{ObjectSymbol, Relocation, RelocationKind, SectionKind, SymbolKind, SymbolVisibility};
@@ -15,7 +15,7 @@ use std::path::PathBuf;
 
 use crate::arch::Architecture;
 use crate::layout::{Section, Segment};
-use crate::symbol::{DefinedSymbol, is_optional_symbol};
+use crate::symbol::{is_optional_symbol, DefinedSymbol};
 use crate::utils::align_up;
 use crate::writer;
 
@@ -66,7 +66,9 @@ impl<'a, A: Architecture> Linker<'a, A> {
             if data.as_ptr().align_offset(8) != 0 {
                 data = Box::leak(data.to_vec().into_boxed_slice());
             }
-            let Ok(obj) = object::File::parse(data) else { continue };
+            let Ok(obj) = object::File::parse(data) else {
+                continue;
+            };
             for sym in obj.symbols() {
                 let Ok(name) = sym.name() else { continue };
                 if !sym.is_undefined() && !sym.is_local() {
@@ -78,10 +80,15 @@ impl<'a, A: Architecture> Linker<'a, A> {
         // Pull in members defining needed symbols (iterate until fixpoint)
         let mut included = HashSet::new();
         loop {
-            let needed: Vec<_> = self.undefined.iter()
+            let needed: Vec<_> = self
+                .undefined
+                .iter()
                 .filter(|s| index.contains_key(*s) && !included.contains(*s))
-                .cloned().collect();
-            if needed.is_empty() { break }
+                .cloned()
+                .collect();
+            if needed.is_empty() {
+                break;
+            }
             for sym in needed {
                 if let Some(&data) = index.get(&sym) {
                     included.insert(sym);
@@ -100,8 +107,11 @@ impl<'a, A: Architecture> Linker<'a, A> {
             let name = sym.name()?;
 
             if sym.is_undefined() {
-                if sym.is_weak() || sym.visibility() == SymbolVisibility::Hidden
-                    || (sym.kind() == SymbolKind::Tls) || is_optional_symbol(name) {
+                if sym.is_weak()
+                    || sym.visibility() == SymbolVisibility::Hidden
+                    || (sym.kind() == SymbolKind::Tls)
+                    || is_optional_symbol(name)
+                {
                     self.weak.insert(name.to_string());
                 } else if !self.symbols.contains_key(name) {
                     self.undefined.insert(name.to_string());
@@ -109,14 +119,24 @@ impl<'a, A: Architecture> Linker<'a, A> {
                 continue;
             }
 
-            if sym.is_local() { continue }
-            if self.symbols.contains_key(name) && !self.symbols[name].is_weak { continue }
+            if sym.is_local() {
+                continue;
+            }
+            if self.symbols.contains_key(name) && !self.symbols[name].is_weak {
+                continue;
+            }
 
             self.undefined.remove(name);
-            self.symbols.insert(name.to_string(), DefinedSymbol::new(
-                idx, sym.section_index().unwrap_or(SectionIndex(0)),
-                sym.address(), sym.is_weak(), sym.section_index().is_none(),
-            ));
+            self.symbols.insert(
+                name.to_string(),
+                DefinedSymbol::new(
+                    idx,
+                    sym.section_index().unwrap_or(SectionIndex(0)),
+                    sym.address(),
+                    sym.is_weak(),
+                    sym.section_index().is_none(),
+                ),
+            );
         }
 
         self.objects.push(obj);
@@ -144,8 +164,12 @@ impl<'a, A: Architecture> Linker<'a, A> {
 
         for (file_idx, obj) in self.objects.iter().enumerate() {
             for sec in obj.sections() {
-                if sec.size() == 0 { continue }
-                let Some(seg_idx) = self.segment_for(&sec) else { continue };
+                if sec.size() == 0 {
+                    continue;
+                }
+                let Some(seg_idx) = self.segment_for(&sec) else {
+                    continue;
+                };
 
                 let seg = &mut self.segments[seg_idx];
                 let off = align_up(seg.size, sec.align().max(1));
@@ -156,8 +180,13 @@ impl<'a, A: Architecture> Linker<'a, A> {
                     seg.data.extend_from_slice(sec.data()?);
                 }
 
-                seg.sections.push(Section { file_index: file_idx, section_index: sec.index(), offset: off });
-                self.section_map.insert((file_idx, sec.index()), (seg_idx, off));
+                seg.sections.push(Section {
+                    file_index: file_idx,
+                    section_index: sec.index(),
+                    offset: off,
+                });
+                self.section_map
+                    .insert((file_idx, sec.index()), (seg_idx, off));
             }
         }
 
@@ -166,13 +195,17 @@ impl<'a, A: Architecture> Linker<'a, A> {
         // Assign addresses
         let (mut va, mut fo) = (BASE_ADDR + PAGE_SIZE, PAGE_SIZE);
         for seg in &mut self.segments {
-            if seg.size == 0 { continue }
+            if seg.size == 0 {
+                continue;
+            }
             va = align_up(va, PAGE_SIZE);
             fo = align_up(fo, PAGE_SIZE);
             seg.virtual_address = va;
             seg.file_offset = fo;
             va += seg.size;
-            if seg.kind != SectionKind::UninitializedData { fo += seg.size; }
+            if seg.kind != SectionKind::UninitializedData {
+                fo += seg.size;
+            }
         }
         Ok(())
     }
@@ -188,8 +221,11 @@ impl<'a, A: Architecture> Linker<'a, A> {
                 SectionKind::Data | SectionKind::Elf(14) | SectionKind::Elf(15) => Some(4),
                 SectionKind::Tls => Some(6),
                 SectionKind::UninitializedData => Some(7),
-                _ => { tracing::debug!("Skip: {} ({:?})", sec.name().unwrap_or("?"), sec.kind()); None }
-            }
+                _ => {
+                    tracing::debug!("Skip: {} ({:?})", sec.name().unwrap_or("?"), sec.kind());
+                    None
+                }
+            },
         }
     }
 
@@ -198,11 +234,16 @@ impl<'a, A: Architecture> Linker<'a, A> {
         for obj in &self.objects {
             for sec in obj.sections() {
                 for (_, r) in sec.relocations() {
-                    let needs = matches!(r.kind(), RelocationKind::Got | RelocationKind::GotRelative)
-                        || matches!(r.target(), RelocationTarget::Symbol(i)
+                    let needs =
+                        matches!(r.kind(), RelocationKind::Got | RelocationKind::GotRelative)
+                            || matches!(r.target(), RelocationTarget::Symbol(i)
                             if obj.symbol_by_index(i).is_ok_and(|s| s.kind() == SymbolKind::Tls));
-                    if !needs { continue }
-                    let RelocationTarget::Symbol(i) = r.target() else { continue };
+                    if !needs {
+                        continue;
+                    }
+                    let RelocationTarget::Symbol(i) = r.target() else {
+                        continue;
+                    };
                     let name = obj.symbol_by_index(i)?.name()?;
                     if !self.got.contains_key(name) {
                         self.got.insert(name.to_string(), off);
@@ -222,40 +263,69 @@ impl<'a, A: Architecture> Linker<'a, A> {
         for sym in self.symbols.values_mut() {
             sym.resolved_address = if sym.is_absolute {
                 Some(sym.offset)
-            } else if let Some(&(si, o)) = self.section_map.get(&(sym.input_file_index, sym.section_index)) {
+            } else if let Some(&(si, o)) = self
+                .section_map
+                .get(&(sym.input_file_index, sym.section_index))
+            {
                 Some(self.segments[si].virtual_address + o + sym.offset)
-            } else { None };
+            } else {
+                None
+            };
         }
     }
 
     fn relocate(&mut self) -> Result<()> {
         // Fill GOT
-        let entries: Vec<_> = self.got.iter().map(|(n, &o)| (o, self.sym_addr(n))).collect();
+        let entries: Vec<_> = self
+            .got
+            .iter()
+            .map(|(n, &o)| (o, self.sym_addr(n)))
+            .collect();
         if let Some(g) = self.segments.iter_mut().find(|s| s.name == ".got") {
-            for (o, a) in entries { g.data[o as usize..][..8].copy_from_slice(&a.to_le_bytes()); }
+            for (o, a) in entries {
+                g.data[o as usize..][..8].copy_from_slice(&a.to_le_bytes());
+            }
         }
 
         // Apply relocations
         let got_va = self.got_addr();
         for si in 0..self.segments.len() {
-            let patches: Vec<_> = self.segments[si].sections.clone().iter().flat_map(|sec| {
-                let obj = &self.objects[sec.file_index];
-                let s = obj.section_by_index(sec.section_index).ok()?;
-                let base = self.segments[si].virtual_address + sec.offset;
-                Some(s.relocations().filter_map(|(o, r)| {
-                    let t = self.reloc_target(obj, &r, sec.file_index, got_va).ok()??;
-                    Some((sec.offset + o, r, base + o, t))
-                }).collect::<Vec<_>>())
-            }).flatten().collect();
+            let patches: Vec<_> = self.segments[si]
+                .sections
+                .clone()
+                .iter()
+                .flat_map(|sec| {
+                    let obj = &self.objects[sec.file_index];
+                    let s = obj.section_by_index(sec.section_index).ok()?;
+                    let base = self.segments[si].virtual_address + sec.offset;
+                    Some(
+                        s.relocations()
+                            .filter_map(|(o, r)| {
+                                let t =
+                                    self.reloc_target(obj, &r, sec.file_index, got_va).ok()??;
+                                Some((sec.offset + o, r, base + o, t))
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .flatten()
+                .collect();
 
             for (o, r, p, t) in patches {
-                self.arch.apply_relocation(o, &r, p, t, r.addend(), &mut self.segments[si].data)?;
+                self.arch
+                    .apply_relocation(o, &r, p, t, r.addend(), &mut self.segments[si].data)?;
             }
         }
         Ok(())
     }
 
-    fn reloc_target(&self, obj: &object::File, r: &Relocation, fi: usize, got: u64) -> Result<Option<u64>> {
+    fn reloc_target(
+        &self,
+        obj: &object::File,
+        r: &Relocation,
+        fi: usize,
+        got: u64,
+    ) -> Result<Option<u64>> {
         Ok(match r.target() {
             RelocationTarget::Symbol(i) => {
                 let s = obj.symbol_by_index(i)?;
@@ -282,24 +352,45 @@ impl<'a, A: Architecture> Linker<'a, A> {
         }
         let name = s.name()?;
         let addr = self.sym_addr(name);
-        if addr == 0 && !self.weak.contains(name) && !is_optional_symbol(name) && !self.symbols.contains_key(name) {
+        if addr == 0
+            && !self.weak.contains(name)
+            && !is_optional_symbol(name)
+            && !self.symbols.contains_key(name)
+        {
             return Err(anyhow!("undefined: {}", name));
         }
         Ok(addr)
     }
 
     fn sym_addr(&self, name: &str) -> u64 {
-        if name == "_GLOBAL_OFFSET_TABLE_" { return self.got_addr(); }
-        self.symbols.get(name).and_then(|s| s.resolved_address)
-            .unwrap_or_else(|| if self.weak.contains(name) || is_optional_symbol(name) { 0 } else { 0 })
+        if name == "_GLOBAL_OFFSET_TABLE_" {
+            return self.got_addr();
+        }
+        self.symbols
+            .get(name)
+            .and_then(|s| s.resolved_address)
+            .unwrap_or_else(|| {
+                if self.weak.contains(name) || is_optional_symbol(name) {
+                    0
+                } else {
+                    0
+                }
+            })
     }
 
     fn sec_addr(&self, fi: usize, si: SectionIndex) -> u64 {
-        self.section_map.get(&(fi, si)).map(|&(i, o)| self.segments[i].virtual_address + o).unwrap_or(0)
+        self.section_map
+            .get(&(fi, si))
+            .map(|&(i, o)| self.segments[i].virtual_address + o)
+            .unwrap_or(0)
     }
 
     fn got_addr(&self) -> u64 {
-        self.segments.iter().find(|s| s.name == ".got").map(|s| s.virtual_address).unwrap_or(0)
+        self.segments
+            .iter()
+            .find(|s| s.name == ".got")
+            .map(|s| s.virtual_address)
+            .unwrap_or(0)
     }
 
     pub fn write(&self, out: &PathBuf) -> Result<()> {

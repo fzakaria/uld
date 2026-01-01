@@ -25,11 +25,7 @@ fn u64(v: u64) -> U64<Endianness> {
 }
 
 /// Write an ELF executable to disk.
-pub fn write_elf(
-    output_path: &PathBuf,
-    segments: &[Segment],
-    entry_point: u64,
-) -> Result<()> {
+pub fn write_elf(output_path: &PathBuf, segments: &[Segment], entry_point: u64) -> Result<()> {
     let mut buffer = Vec::new();
     let num_sections = segments.len() as u32 + 2;
 

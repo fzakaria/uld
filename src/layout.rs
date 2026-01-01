@@ -17,7 +17,7 @@ pub struct Section {
     /// Index of the section in the input file.
     pub section_index: SectionIndex,
     /// The offset where this section starts within the `Segment`.
-    pub offset: u64, 
+    pub offset: u64,
 }
 
 /// Represents a segment in the final output executable.
@@ -36,7 +36,7 @@ pub struct Segment {
     /// The file offset where this segment starts in the ELF file.
     pub file_offset: u64,
     /// The raw data content of the segment.
-    pub data: Vec<u8>, 
+    pub data: Vec<u8>,
     /// The kind of segment (Text, Data, etc.) used for permissions and mapping.
     pub kind: SectionKind,
 }

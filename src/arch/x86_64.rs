@@ -71,10 +71,7 @@ impl Architecture for X86_64 {
                 if offset + 4 <= data.len() {
                     data[offset..offset + 4].copy_from_slice(&bytes);
                 } else {
-                    return Err(anyhow!(
-                        "Relocation offset out of bounds at 0x{:x}",
-                        offset
-                    ));
+                    return Err(anyhow!("Relocation offset out of bounds at 0x{:x}", offset));
                 }
             }
             64 => {
@@ -82,10 +79,7 @@ impl Architecture for X86_64 {
                 if offset + 8 <= data.len() {
                     data[offset..offset + 8].copy_from_slice(&bytes);
                 } else {
-                    return Err(anyhow!(
-                        "Relocation offset out of bounds at 0x{:x}",
-                        offset
-                    ));
+                    return Err(anyhow!("Relocation offset out of bounds at 0x{:x}", offset));
                 }
             }
             _ => return Err(anyhow!("Unsupported relocation size: {}", reloc.size())),

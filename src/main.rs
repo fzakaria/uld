@@ -16,7 +16,9 @@ fn main() -> Result<()> {
     let config = Config::parse();
 
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_new(&config.log_level).unwrap_or_else(|_| EnvFilter::new("warn")))
+        .with_env_filter(
+            EnvFilter::try_new(&config.log_level).unwrap_or_else(|_| EnvFilter::new("warn")),
+        )
         .init();
 
     let files = config.input_files();
@@ -25,18 +27,21 @@ fn main() -> Result<()> {
     }
 
     // Memory-map files
-    let mmaps: Vec<_> = files.iter().map(|p| {
-        info!("Loading: {}", p.display());
-        let f = File::open(p).with_context(|| format!("open {}", p.display()))?;
-        let m = unsafe { Mmap::map(&f)? };
-        if !m.starts_with(b"!<arch>\n") {
-            let obj = object::File::parse(&*m)?;
-            if obj.architecture() != ObjArch::X86_64 {
-                anyhow::bail!("unsupported: {:?}", obj.architecture());
+    let mmaps: Vec<_> = files
+        .iter()
+        .map(|p| {
+            info!("Loading: {}", p.display());
+            let f = File::open(p).with_context(|| format!("open {}", p.display()))?;
+            let m = unsafe { Mmap::map(&f)? };
+            if !m.starts_with(b"!<arch>\n") {
+                let obj = object::File::parse(&*m)?;
+                if obj.architecture() != ObjArch::X86_64 {
+                    anyhow::bail!("unsupported: {:?}", obj.architecture());
+                }
             }
-        }
-        Ok((p.clone(), m))
-    }).collect::<Result<Vec<_>>>()?;
+            Ok((p.clone(), m))
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     // Link
     let mut linker = Linker::new(X86_64);

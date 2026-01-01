@@ -11,8 +11,8 @@
 
 pub mod arch;
 pub mod config;
-pub mod linker;
 pub mod layout;
+pub mod linker;
 pub mod symbol;
 pub mod utils;
 pub mod writer;

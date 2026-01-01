@@ -50,8 +50,9 @@ impl DefinedSymbol {
 
 /// Known symbols that can remain undefined (resolve to 0).
 pub fn is_optional_symbol(name: &str) -> bool {
-    matches!(name,
+    matches!(
+        name,
         "_DYNAMIC" | "__dso_handle" | "_dl_find_object" | "__TMC_END__"
     ) || name.starts_with("__TMC_")
-      || name.starts_with("__gcc_")
+        || name.starts_with("__gcc_")
 }
