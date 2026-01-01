@@ -15,42 +15,38 @@ use uld::linker::Linker;
 fn main() -> Result<()> {
     let config = Config::parse();
 
-    // Initialize logging
-    let filter = EnvFilter::try_from_default_env()
-        .or_else(|_| EnvFilter::try_new(&config.log_level))
-        .unwrap_or_else(|_| EnvFilter::new("warn"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::try_new(&config.log_level).unwrap_or_else(|_| EnvFilter::new("warn")))
+        .init();
 
-    // Parse inputs (handles -l, -L, -o in order)
-    let inputs = config.parse_inputs();
-    if inputs.files.is_empty() {
+    let (output, files) = config.parse_args();
+    if files.is_empty() {
         anyhow::bail!("no input files");
     }
 
-    // Memory-map and verify architecture
-    let mut mmaps = Vec::new();
-    for path in &inputs.files {
-        info!("Processing: {}", path.display());
-        let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-        let mmap = unsafe { Mmap::map(&file)? };
-
-        if !mmap.starts_with(b"!<arch>\n") {
-            let obj = object::File::parse(&*mmap)?;
+    // Memory-map files
+    let mmaps: Vec<_> = files.iter().map(|p| {
+        info!("Loading: {}", p.display());
+        let f = File::open(p).with_context(|| format!("open {}", p.display()))?;
+        let m = unsafe { Mmap::map(&f)? };
+        // Check architecture (skip archives)
+        if !m.starts_with(b"!<arch>\n") {
+            let obj = object::File::parse(&*m)?;
             if obj.architecture() != ObjArch::X86_64 {
-                anyhow::bail!("unsupported architecture: {:?}", obj.architecture());
+                anyhow::bail!("unsupported: {:?}", obj.architecture());
             }
         }
-        mmaps.push((path.clone(), mmap));
-    }
+        Ok((p.clone(), m))
+    }).collect::<Result<Vec<_>>>()?;
 
     // Link
     let mut linker = Linker::new(X86_64);
-    for (path, mmap) in &mmaps {
-        linker.add_file(path.clone(), mmap)?;
+    for (p, m) in &mmaps {
+        linker.add_file(p.clone(), m)?;
     }
     linker.link()?;
-    linker.write(&inputs.output)?;
+    linker.write(&output)?;
 
-    info!("Linked: {}", inputs.output.display());
+    info!("Wrote: {}", output.display());
     Ok(())
 }
