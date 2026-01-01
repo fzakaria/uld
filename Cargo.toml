@@ -7,6 +7,6 @@ edition = "2021"
 object = { git = "https://github.com/fzakaria/object", branch = "fzakaria/missing-reloc-visibility", default-features = false, features = ["read_core", "write_std", "elf", "std", "archive"] }
 memmap2 = "0.9"
 anyhow = "1.0"
-clap = { version = "4.4", features = ["derive"] }
+clap = { version = "4.5", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
