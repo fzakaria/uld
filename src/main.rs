@@ -1,6 +1,7 @@
 //! Entry point for the uld linker.
 
 use anyhow::{Context, Result};
+use bumpalo::Bump;
 use clap::Parser;
 use memmap2::Mmap;
 use std::fs::File;
@@ -36,10 +37,13 @@ fn main() -> Result<()> {
         })
         .collect::<Result<Vec<_>>>()?;
 
+    // arena for aligning archive data
+    let arena = Bump::new();
+
     // Link
     let mut linker = Linker::new(X86_64);
     for (p, m) in &mmaps {
-        linker.add_file(p, m)?;
+        linker.add_file(p, &m, &arena)?;
     }
     linker.link()?;
     linker.write(&config.output())?;
