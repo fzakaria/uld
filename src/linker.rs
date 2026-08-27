@@ -7,6 +7,7 @@
 //! 5. Write ELF
 
 use anyhow::{anyhow, Context, Result};
+use bumpalo::Bump;
 use memmap2::Mmap;
 use object::read::{Object, ObjectSection, RelocationTarget, SectionIndex};
 use object::{ObjectSymbol, Relocation, RelocationKind, SectionKind, SymbolKind, SymbolVisibility};
@@ -47,15 +48,15 @@ impl<'a, A: Architecture> Linker<'a, A> {
         }
     }
 
-    pub fn add_file(&mut self, path: &PathBuf, mmap: &'a Mmap) -> Result<()> {
+    pub fn add_file(&mut self, path: &PathBuf, mmap: &'a Mmap, arena: &'a Bump) -> Result<()> {
         // https://alpha-supernova.dev.filibeto.org/lib/rel/5.1B/DOCS/HTML/SUPPDOCS/OBJSPEC/NV160XXX.HTM
         if mmap.starts_with(b"!<arch>\n") {
-            return self.add_archive(path, mmap);
+            return self.add_archive(path, mmap, arena);
         }
         self.add_object(object::File::parse(&**mmap)?)
     }
 
-    fn add_archive(&mut self, path: &PathBuf, mmap: &'a Mmap) -> Result<()> {
+    fn add_archive(&mut self, path: &PathBuf, mmap: &'a Mmap, arena: &'a Bump) -> Result<()> {
         let archive = object::read::archive::ArchiveFile::parse(mmap.as_ref())?;
 
         // Loop over all the object files within the archive
@@ -67,8 +68,7 @@ impl<'a, A: Architecture> Linker<'a, A> {
             // Align for parsing
             if data.as_ptr().align_offset(8) != 0 {
                 // Force the data onto the heap to get it aligned
-                // FIXME: Can we avoid this leak?
-                data = Box::leak(data.to_vec().into_boxed_slice());
+                data = arena.alloc_slice_copy(data);
             }
             let Ok(obj) = object::File::parse(data) else {
                 tracing::info!(
